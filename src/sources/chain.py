@@ -148,12 +148,12 @@ class ChainListener:
             self._block_ts.popitem(last=False)
 
     async def run_forever(self) -> None:
+        # Соединение держим всегда, даже без кошельков: подписка на новые
+        # блоки показывает, что провайдер живой (видно в «🩺 Источники»), а
+        # первый добавленный кошелёк подписывается мгновенно, без нового
+        # TCP/TLS-рукопожатия.
         backoff = 1.0
         while True:
-            if not state.active_addresses():
-                self.connected = False
-                await self.changed.wait()
-                continue
             try:
                 async with websockets.connect(self.url, ping_interval=20, ping_timeout=20,
                                               max_size=2 ** 22, open_timeout=15) as ws:
