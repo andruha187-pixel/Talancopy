@@ -108,7 +108,7 @@ class Settings:
     # Для скольких лучших мерить «проскальзывание при копировании».
     DISCOVERY_DRIFT_WALLETS: int = _get_int("DISCOVERY_DRIFT_WALLETS", 40)
     # Сколько лучших кошельков класть в архив с полными сделками/позициями.
-    DISCOVERY_ARCHIVE_DETAIL: int = _get_int("DISCOVERY_ARCHIVE_DETAIL", 60)
+    DISCOVERY_ARCHIVE_DETAIL: int = _get_int("DISCOVERY_ARCHIVE_DETAIL", 40)
     # Перепись активных кошельков из потока RTDS (кандидаты для поиска).
     CENSUS_ENABLED: bool = _get_bool("CENSUS_ENABLED", True)
     CENSUS_MIN_TRADE_USDC: float = _get_float("CENSUS_MIN_TRADE_USDC", 50.0)
