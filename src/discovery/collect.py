@@ -10,13 +10,29 @@ import logging
 import time
 
 from src import db, http
-from src.discovery.analyze import is_fast
+from src.discovery.analyze import decisions, is_fast, stats_summary
 from src.util import fnum, norm_addr
 
 log = logging.getLogger("discovery.collect")
 
 LEADERBOARD_CATEGORIES = ["overall", "politics", "sports", "crypto", "culture", "economics", "finance",
                           "tech", "geopolitics", "weather", "mentions", "esports"]
+
+# Сколько строк тянуть по кошельку. Закрытые/непогашенные отсортированы по
+# последнему событию; analyze.sample_window() по этим лимитам понимает, за
+# какой период выборка полная.
+CAP_CLOSED = 1000
+CAP_REDEEMABLE = 500
+CAP_OPEN = 300
+CAP_ACTIVITY = 1000
+CAP_TAKER = 1000
+
+
+def stats_pnl(stats: dict | None, default: float | None = None) -> float | None:
+    """Торговый PnL за всё время из /v2/user-stats (там all_time_pnl —
+    объект, а не число)."""
+    v = stats_summary(stats)["trading_pnl"]
+    return default if v is None else v
 
 
 async def _get(path: str, params: dict, retries: int = 2):
@@ -168,6 +184,9 @@ async def pnl_points(wallet: str) -> list[dict]:
 
 
 async def positions(wallet: str, status: str, rows: int, sort_by: str = "TIMESTAMP") -> list[dict]:
+    """status: OPEN (держит сейчас, включая разрешённые непогашенные),
+    CLOSED (продал или погасил), REDEEMABLE (разрешённые непогашенные,
+    в том числе проигранные — REDEEMABLE_LOST их подмножество)."""
     try:
         return await paged("/v2/positions", {"user": wallet, "status": status, "sort_by": sort_by,
                                              "sort_direction": "DESC"}, rows, page=500)
@@ -196,67 +215,71 @@ async def taker_trades(wallet: str, start_ts: int | None, rows: int = 1000) -> l
 
 
 async def market_trades_after(condition_id: str, start_ts: int, seconds: int = 90) -> list[dict]:
+    """Сделки рынка в окне [start_ts, start_ts + seconds]. Data API отдаёт
+    последние сделки до end (start, судя по ответам, не применяет), поэтому
+    окно режем сами."""
     try:
-        payload = await _get("/v2/trades", {"condition_id": condition_id, "start": int(start_ts),
-                                            "end": int(start_ts + seconds), "limit": 200, "taker_only": "true"},
+        payload = await _get("/v2/trades", {"condition_id": condition_id, "start": int(start_ts) - 600,
+                                            "end": int(start_ts + seconds), "limit": 300, "taker_only": "true"},
                              retries=1)
     except http.ApiError:
         return []
-    return http.data_items(payload)
+    out = []
+    for r in http.data_items(payload):
+        t = fnum(r.get("timestamp"))
+        t = t / 1000 if t > 1e12 else t
+        if start_ts <= t <= start_ts + seconds:
+            out.append(r)
+    return out
 
 
-async def drift_samples(trades: list[dict], max_samples: int = 12) -> list[dict]:
+async def drift_samples(trades: list[dict], max_samples: int = 12, min_usdc: float = 20.0) -> list[dict]:
     """Насколько цена уходит против копирующего: берём их последние
-    покупки (не быстрые рынки) и смотрим цену того же исхода в сделках
-    через ≥3 с и в течение минуты после."""
-    seen_tx = set()
+    покупки-решения (склейка исполнений одного токена, не быстрые рынки,
+    от $20) и смотрим цену того же исхода в сделках других людей через
+    ≥3 с и в течение минуты после."""
+    rows = [t for t in trades if str(t.get("side") or "").upper() == "BUY"]
     picks = []
-    for t in sorted(trades, key=lambda r: -fnum(r.get("timestamp"))):
-        if str(t.get("side") or "").upper() != "BUY":
+    for d in sorted(decisions(rows), key=lambda d: -d["t0"]):
+        if d["usdc"] < min_usdc or d["shares"] <= 0 or is_fast(d["slug"], d["event_slug"]) or not d["cond"]:
             continue
-        tx = t.get("transaction_hash")
-        if tx in seen_tx or is_fast(t.get("slug"), t.get("event_slug")):
-            continue
-        seen_tx.add(tx)
-        picks.append(t)
+        picks.append(d)
         if len(picks) >= max_samples:
             break
+    own_tx = {str(t.get("transaction_hash") or "").lower() for t in trades}
     out = []
-    for t in picks:
-        ts = fnum(t.get("timestamp"))
-        ts = ts / 1000 if ts > 1e12 else ts
-        cid = t.get("condition_id")
-        token = str(t.get("token_id"))
-        price = fnum(t.get("price"))
-        if not cid or price <= 0:
-            continue
-        after = await market_trades_after(cid, int(ts), 90)
+    for d in picks:
+        ts = d["t0"]
+        token = d["token"]
+        price = d["usdc"] / d["shares"]
+        after = await market_trades_after(d["cond"], int(ts), 90)
         pts = []
         for r in after:
             rts = fnum(r.get("timestamp"))
             rts = rts / 1000 if rts > 1e12 else rts
-            if rts < ts + 3 or r.get("transaction_hash") == t.get("transaction_hash"):
+            if rts < ts + 3 or str(r.get("transaction_hash") or "").lower() in own_tx:
                 continue
             p = fnum(r.get("price"))
             if p <= 0:
                 continue
-            same = str(r.get("token_id")) == token
+            same = str(r.get("token_id") or r.get("asset") or "") == token
             pts.append((rts, p if same else 1.0 - p))
         pts.sort()
         if not pts:
-            out.append({"ts": ts, "token": token, "price": price, "drift_3s": None, "drift_60s": None})
+            out.append({"ts": ts, "token": token, "price": price, "slug": d["slug"],
+                        "drift_3s": None, "drift_60s": None})
             continue
         first = pts[0][1]
         within = [p for rts, p in pts if rts <= ts + 60]
         mid = sorted(within)[len(within) // 2] if within else None
-        out.append({"ts": ts, "token": token, "price": price, "slug": t.get("slug"),
+        out.append({"ts": ts, "token": token, "price": price, "slug": d["slug"],
                     "drift_3s": round((first - price) * 100, 3),
                     "drift_60s": round((mid - price) * 100, 3) if mid is not None else None})
     return out
 
 
 async def fetch_wallet(wallet: str, stats: dict | None = None, with_drift: bool = False,
-                       detail_rows: int = 500) -> dict:
+                       detail_rows: int = CAP_CLOSED) -> dict:
     """Всё сырьё по кошельку для analyze_wallet()."""
     if stats is None:
         try:
@@ -265,18 +288,17 @@ async def fetch_wallet(wallet: str, stats: dict | None = None, with_drift: bool 
             stats = None
     pts_t = asyncio.create_task(pnl_points(wallet))
     closed_t = asyncio.create_task(positions(wallet, "CLOSED", detail_rows))
-    redeem_t = asyncio.create_task(positions(wallet, "REDEEMABLE", 300))
-    lost_t = asyncio.create_task(positions(wallet, "REDEEMABLE_LOST", 300))
-    open_t = asyncio.create_task(positions(wallet, "OPEN", 200, sort_by="CURRENT_VALUE"))
-    act_t = asyncio.create_task(activity(wallet, 1000))
+    redeem_t = asyncio.create_task(positions(wallet, "REDEEMABLE", CAP_REDEEMABLE))
+    open_t = asyncio.create_task(positions(wallet, "OPEN", CAP_OPEN, sort_by="CURRENT_VALUE"))
+    act_t = asyncio.create_task(activity(wallet, CAP_ACTIVITY))
     trades = await act_t
     lo = None
     if trades:
         tss = [fnum(t.get("timestamp")) for t in trades if t.get("timestamp")]
         lo = int(min(tss) / 1000 if tss and min(tss) > 1e12 else min(tss)) if tss else None
-    taker = await taker_trades(wallet, lo)
+    taker = await taker_trades(wallet, lo, CAP_TAKER)
     raw = {"wallet": wallet, "stats": stats or {}, "pnl_points": await pts_t, "closed": await closed_t,
-           "redeemable": (await redeem_t) + (await lost_t), "open": await open_t, "trades": trades,
-           "taker_trades": taker}
+           "redeemable": await redeem_t, "open": await open_t, "trades": trades, "taker_trades": taker,
+           "caps": {"closed": detail_rows, "redeemable": CAP_REDEEMABLE, "taker": CAP_TAKER}}
     raw["drift"] = await drift_samples(trades) if with_drift else []
     return raw

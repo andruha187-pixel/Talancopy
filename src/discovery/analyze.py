@@ -8,9 +8,23 @@
 Поэтому основа оценки — не винрейт и не сумма PnL, а «edge»: насколько
 реальный результат каждой ставки лучше цены, по которой она куплена, и
 насколько это статистически значимо (z-score). Остальное — копируемость:
-частота сделок (бот или человек), время удержания, быстрые рынки,
+частота решений (бот или человек), время удержания, быстрые рынки,
 маркет-мейкинг, зависимость от одной удачной ставки, проскальзывание
 после их входа, стабильность по неделям.
+
+Формат Data API v2 (проверено на живых ответах, октябрь 2026):
+  * позиция: total_size — куплено акций за всё время, avg_price — средняя
+    цена входа, entry_cost_usdc — стоимость ТЕКУЩЕГО остатка (у закрытой
+    позиции 0!), realized_pnl / total_pnl, percent_realized_pnl =
+    realized_pnl / (total_size × avg_price) × 100, first_entry_at,
+    last_event_at, end_date, redeemable;
+  * статус OPEN включает и уже разрешённые, но не погашенные позиции
+    (redeemable=true); REDEEMABLE — разрешённые и не погашенные, в том
+    числе проигранные (REDEEMABLE_LOST — их подмножество);
+  * /v2/user-pnl и all_time_pnl в /v2/user-stats — накопленные значения:
+    position_pnl (торговый, после комиссий), realized_pnl, unrealized_pnl,
+    economic_pnl (= position_pnl + wallet_income), wallet_income (ребейты,
+    награды, доходность, рефералка), fees_refunded, volume_usdc, trade_count.
 """
 from __future__ import annotations
 
@@ -19,6 +33,7 @@ import re
 import statistics
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from src.util import fnum
 
@@ -31,20 +46,32 @@ CATEGORY_RULES = [
                           r"-above-|microstrategy|coinbase|altcoin|memecoin|pump")),
     ("sports", re.compile(r"nfl|nba|mlb|nhl|wnba|epl|premier-league|champions-league|la-liga|serie-a|bundesliga|"
                           r"ligue-1|mls|ufc|boxing|tennis|atp|wta|f1|formula-1|nascar|golf|pga|cricket|ipl|ncaa|"
-                          r"-vs-|super-bowl|world-cup|euro-20|copa|olympic|match|game-\d|esports|cs2|dota|lol-|valorant")),
+                          r"-vs-|super-bowl|world-cup|euro-20|copa|olympic|match|game-\d|esports|cs2|dota|lol-|valorant|"
+                          r"fifwc|fifa")),
     ("politics", re.compile(r"election|president|presidential|senate|house-|congress|governor|mayor|trump|biden|"
                             r"harris|vance|newsom|democrat|republican|gop|primary|nominee|parliament|prime-minister|"
-                            r"vote|poll|cabinet|impeach|supreme-court|government-shutdown")),
+                            r"vote|poll|cabinet|impeach|supreme-court|government-shutdown|lula|bolsonaro")),
     ("geopolitics", re.compile(r"war|ukraine|russia|israel|gaza|iran|china-|taiwan|nato|ceasefire|invasion|strike|"
-                               r"missile|sanction|putin|zelensk|netanyahu|hamas|hezbollah")),
+                               r"missile|sanction|putin|zelensk|netanyahu|hamas|hezbollah|invade")),
     ("economics", re.compile(r"fed-|fomc|rate-cut|interest-rate|inflation|cpi|gdp|recession|unemployment|jobs-report|"
                              r"payroll|tariff|treasury|powell")),
     ("finance", re.compile(r"stock|nasdaq|s-p-500|sp500|dow-|tesla|nvidia|apple|google|amazon|microsoft|meta-|"
-                           r"ipo|earnings|market-cap|gold|oil|silver")),
+                           r"ipo|earnings|market-cap|gold|oil|silver|wti")),
     ("culture", re.compile(r"oscar|grammy|emmy|movie|box-office|album|song|spotify|taylor-swift|celebrity|tiktok|"
                            r"youtube|mrbeast|twitter|tweet|elon|musk|mentions|say-|said")),
     ("weather", re.compile(r"temperature|weather|hurricane|snow|rain|heat|climate")),
 ]
+
+# Исполнения одного токена и стороны ближе этого (сек) — одно решение
+# человека: лимитку, которую «съели» 30 разных тейкеров, activity отдаёт
+# 30 строками с разными транзакциями.
+DECISION_GAP_SEC = 600
+# Позиции дешевле — пыль (остатки, тестовые покупки), в статистику ставок не идут.
+MIN_BET_USDC = 1.0
+# Данные PnL у Polymarket иногда отстают; старше — помечаем.
+PNL_STALE_DAYS = 3.0
+
+_INCOME_FIELDS = ("maker_rebate", "taker_rebate", "reward_income", "yield_income", "referral_income")
 
 
 def categorize(slug: str | None, event_slug: str | None = None) -> str:
@@ -68,6 +95,33 @@ def _ts(v) -> float:
     return t
 
 
+def _date_ts(v) -> float | None:
+    """Эпоха в секундах из числа или ISO-строки ('2026-08-01',
+    '2026-08-01T12:00:00Z'). '1970-01-01' и прочий мусор → None."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, (int, float)) or str(v).strip().replace(".", "", 1).isdigit():
+        t = _ts(v)
+        return t if t > 1e9 else None
+    try:
+        s = str(v).strip().replace("Z", "+00:00")
+        if len(s) == 10:
+            s += "T00:00:00+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        t = dt.timestamp()
+        return t if t > 1e9 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _truthy(v) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes")
+    return bool(v)
+
+
 def _median(xs: list[float]) -> float | None:
     return statistics.median(xs) if xs else None
 
@@ -80,13 +134,107 @@ def _pct(xs: list[float], q: float) -> float | None:
     return s[k]
 
 
-# ------------------------------------------------------- позиции (edge) ----
+# ------------------------------------------------- профиль (user-stats) ----
 
-def position_pnl(p: dict) -> float:
-    for key in ("total_pnl",):
+def point_trading_pnl(p: dict | None) -> float | None:
+    """Торговый PnL точки (накопленный): position_pnl = реализованный +
+    нереализованный по рынкам, после комиссий. Ребейты, награды, рефералка
+    и доходность сюда не входят — это не навык трейдера."""
+    if not isinstance(p, dict):
+        return None
+    if p.get("position_pnl") is not None:
+        return fnum(p.get("position_pnl"))
+    if p.get("realized_pnl") is not None:
+        return fnum(p.get("realized_pnl")) + fnum(p.get("unrealized_pnl"))
+    for key in ("total_pnl", "cumulative_pnl", "pnl"):   # прежние форматы
         if p.get(key) is not None:
             return fnum(p.get(key))
+    return None
+
+
+def point_income(p: dict | None) -> float:
+    """Доход не от сделок: ребейты мейкера/тейкера, награды за ликвидность,
+    доходность, рефералка."""
+    if not isinstance(p, dict):
+        return 0.0
+    if p.get("wallet_income") is not None:
+        return fnum(p.get("wallet_income"))
+    return sum(fnum(p.get(k)) for k in _INCOME_FIELDS)
+
+
+def stats_summary(stats: dict | None) -> dict:
+    """/v2/user-stats → плоские числа. all_time_pnl там — объект (как точка
+    /v2/user-pnl), а не число; trades — число рынков, где торговал."""
+    st = stats if isinstance(stats, dict) else {}
+    atp = st.get("all_time_pnl")
+    out = {"trading_pnl": None, "economic_pnl": None, "wallet_income": None, "fees_refunded": None,
+           "trade_count": None, "volume_usdc": None, "stats_as_of": None,
+           "markets_traded": st.get("trades"),
+           "biggest_win": fnum(st.get("biggest_win")) if st.get("biggest_win") is not None else None,
+           "join_ts": _date_ts(st.get("join_date"))}
+    if isinstance(atp, dict):
+        out["trading_pnl"] = point_trading_pnl(atp)
+        if atp.get("economic_pnl") is not None:
+            out["economic_pnl"] = fnum(atp.get("economic_pnl"))
+        out["wallet_income"] = point_income(atp)
+        out["fees_refunded"] = fnum(atp.get("fees_refunded"))
+        out["trade_count"] = atp.get("trade_count")
+        if atp.get("volume_usdc") is not None:
+            out["volume_usdc"] = fnum(atp.get("volume_usdc"))
+        out["stats_as_of"] = _ts(atp.get("timestamp")) or None
+    elif atp is not None:
+        out["trading_pnl"] = fnum(atp)
+    return out
+
+
+# ------------------------------------------------------- позиции (edge) ----
+
+def position_cost(p: dict) -> float:
+    """Сколько вложено в позицию за всё время.
+
+    В v2 entry_cost_usdc — стоимость текущего остатка (у закрытой позиции
+    0), поэтому основа — total_size (куплено акций всего) × avg_price. Для
+    закрытых точнее realized_pnl / percent_realized_pnl: avg_price в ответе
+    обрезан до 4 знаков и на дешёвых входах (0.0034) врёт на проценты."""
+    avg = fnum(p.get("avg_price"))
+    total = fnum(p.get("total_size"))
+    base = total * avg if total > 0 and avg > 0 else 0.0
+    rp = fnum(p.get("realized_pnl"))
+    prp = fnum(p.get("percent_realized_pnl"))
+    closed = p.get("current_size") is not None and fnum(p.get("current_size")) <= 0
+    if closed and abs(rp) > 1e-9 and abs(prp) > 1e-9:
+        alt = rp / (prp / 100.0)
+        if alt > 0 and (base <= 0 or 0.5 <= alt / base <= 2.0):
+            return alt
+    if base > 0:
+        return base
+    for key in ("initial_value", "initialValue"):          # прежние форматы
+        if fnum(p.get(key)) > 0:
+            return fnum(p.get(key))
+    bought = fnum(p.get("total_bought") or p.get("totalBought"))
+    if bought > 0 and avg > 0:
+        return bought * avg
+    return fnum(p.get("entry_cost_usdc"))
+
+
+def position_pnl(p: dict) -> float:
+    if p.get("total_pnl") is not None:
+        return fnum(p.get("total_pnl"))
     return fnum(p.get("realized_pnl")) + fnum(p.get("unrealized_pnl"))
+
+
+def entry_ts(p: dict) -> float:
+    return _ts(p.get("first_entry_at")) or _ts(p.get("last_event_at") or p.get("timestamp"))
+
+
+def settle_ts(p: dict) -> float:
+    """Когда позиция стала окончательной: продажа (last_event_at) или конец
+    рынка (end_date) — что раньше. Погашение выигрыша бывает через недели
+    после конца рынка, поэтому одно last_event_at завышает «свежесть»."""
+    last = _ts(p.get("last_event_at") or p.get("timestamp"))
+    end = _date_ts(p.get("end_date"))
+    cands = [t for t in (last, end) if t]
+    return min(cands) if cands else 0.0
 
 
 def resolved_positions(closed: list[dict], redeemable: list[dict]) -> list[dict]:
@@ -101,18 +249,39 @@ def resolved_positions(closed: list[dict], redeemable: list[dict]) -> list[dict]
     return list(out.values())
 
 
-def edge_metrics(resolved: list[dict], now: float | None = None) -> dict:
+def sample_window(closed: list[dict], redeemable: list[dict], caps: dict | None) -> float | None:
+    """Начало окна, за которое выборка позиций полная.
+
+    Закрытые и непогашенные приходят отсортированными по последнему
+    событию и обрезаются лимитом. Если просто сложить «последние 500
+    закрытых» (это в основном погашенные выигрыши за пару недель) и
+    «последние 300 непогашенных» (это проигрыши, копящиеся годами), edge
+    исказится. Берём только позиции, открытые после начала самого
+    короткого из обрезанных списков: каждая такая позиция гарантированно
+    попала в свой список."""
+    caps = caps or {}
+    starts = []
+    for rows, cap in ((closed, caps.get("closed")), (redeemable, caps.get("redeemable"))):
+        if cap and len(rows) >= cap:
+            ts = [_ts(p.get("last_event_at")) for p in rows if _ts(p.get("last_event_at"))]
+            if ts:
+                starts.append(min(ts))
+    return max(starts) if starts else None
+
+
+def edge_metrics(resolved: list[dict], now: float | None = None, window_start: float | None = None) -> dict:
     now = now or time.time()
     bets = []
     for p in resolved:
-        cost = fnum(p.get("entry_cost_usdc")) or fnum(p.get("initial_value")) or fnum(p.get("total_bought"))
+        if window_start and entry_ts(p) < window_start:
+            continue
+        cost = position_cost(p)
         price = fnum(p.get("avg_price"))
-        if cost <= 0 or not (0.0 < price < 1.0):
+        if cost < MIN_BET_USDC or not (0.0 < price < 1.0):
             continue
         pnl = position_pnl(p)
         y = min(1.0, max(0.0, price * (1.0 + pnl / cost)))
-        bets.append({"cost": cost, "p": price, "pnl": pnl, "y": y,
-                     "ts": _ts(p.get("last_event_at") or p.get("timestamp")),
+        bets.append({"cost": cost, "p": price, "pnl": pnl, "y": y, "ts": settle_ts(p),
                      "slug": p.get("slug"), "event_slug": p.get("event_slug")})
     n = len(bets)
     m: dict = {"n_resolved": n}
@@ -155,7 +324,9 @@ def edge_metrics(resolved: list[dict], now: float | None = None) -> dict:
         bb = [b for b in bets if lo <= b["p"] < hi]
         if bb:
             e = 100.0 * sum(b["y"] - b["p"] for b in bb) / len(bb)
-            parts.append(f"{int(lo * 100)}-{int(hi * 100)}:{e:+.1f}c/n{len(bb)}")
+            c = sum(b["cost"] for b in bb)
+            roi = sum(b["pnl"] for b in bb) / c * 100 if c else 0.0
+            parts.append(f"{int(lo * 100)}-{int(hi * 100)}:{e:+.1f}c/roi{roi:+.0f}%/n{len(bb)}")
     m["edge_by_price"] = " | ".join(parts)
     cats: dict[str, list] = defaultdict(lambda: [0.0, 0.0, 0])
     for b in bets:
@@ -164,37 +335,75 @@ def edge_metrics(resolved: list[dict], now: float | None = None) -> dict:
         c[1] += b["pnl"]
         c[2] += 1
     m["categories"] = " | ".join(
-        f"{k}:{v[0] / cost_total * 100:.0f}% roi{(v[1] / v[0] * 100 if v[0] else 0):+.0f}%"
+        f"{k}:{v[0] / cost_total * 100:.0f}% roi{(v[1] / v[0] * 100 if v[0] else 0):+.0f}% n{v[2]}"
         for k, v in sorted(cats.items(), key=lambda kv: -kv[1][0]))
     m["main_category"] = max(cats.items(), key=lambda kv: kv[1][0])[0] if cats else None
     return m
 
 
+def hold_metrics(closed: list[dict]) -> dict:
+    """Удержание по закрытым позициям: first_entry_at → продажа или конец
+    рынка. Точнее, чем по сделкам: видны сотни позиций, а не 1000 строк."""
+    holds, short_cost, total_cost = [], 0.0, 0.0
+    for p in closed:
+        t0 = _ts(p.get("first_entry_at"))
+        t1 = settle_ts(p)
+        if not t0 or not t1 or t1 < t0:
+            continue
+        h = (t1 - t0) / 3600.0
+        c = max(position_cost(p), 0.0)
+        holds.append(h)
+        total_cost += c
+        if h < 1.0:
+            short_cost += c
+    if len(holds) < 10:
+        return {}
+    return {"median_hold_h": _median(holds),
+            "short_hold_share": short_cost / total_cost if total_cost > 0 else None,
+            "hold_source": "positions"}
+
+
 # ------------------------------------------------------ PnL по дням ----
 
 def pnl_series_metrics(points: list[dict], now: float | None = None) -> dict:
+    """Окна (7/30/90 дн.) считаются от последней точки: у части кошельков
+    Polymarket обновляет PnL с опозданием на дни — иначе «30 дней» тихо
+    превратились бы в «21 день»."""
     now = now or time.time()
     pts = []
     for p in points or []:
         ts = _ts(p.get("timestamp"))
-        v = p.get("total_pnl")
-        if v is None:
-            v = p.get("cumulative_pnl")
+        v = point_trading_pnl(p)
         if ts and v is not None:
-            pts.append((ts, fnum(v), p))
+            pts.append((ts, v, p))
     pts.sort(key=lambda x: x[0])
     m: dict = {"pnl_days": len(pts)}
+    if not pts:
+        return m
+    last_ts, last_v, last_p = pts[-1]
+    m["pnl_total"] = last_v
+    m["pnl_as_of"] = last_ts
+    m["pnl_lag_days"] = max(0.0, (now - last_ts) / 86400.0)
+    m["first_pnl_ts"] = pts[0][0]
+    m["rebates"] = fnum(last_p.get("maker_rebate")) + fnum(last_p.get("taker_rebate"))
+    m["rewards"] = (fnum(last_p.get("reward_income")) + fnum(last_p.get("yield_income")) +
+                    fnum(last_p.get("referral_income")))
+    m["wallet_income"] = point_income(last_p)
+    m["fees_refunded"] = fnum(last_p.get("fees_refunded"))
+    m["fees_paid"] = fnum(last_p.get("fees_paid"))
+    m["volume_usdc"] = fnum(last_p.get("volume_usdc"))
+    m["lp_pnl"] = fnum(last_p.get("realized_lp_pnl"))
+    if last_p.get("economic_pnl") is not None:
+        m["economic_pnl_series"] = fnum(last_p.get("economic_pnl"))
     if len(pts) < 2:
         return m
     vals = [v for _, v, _ in pts]
-    last_ts, last_v, last_p = pts[-1]
 
     def value_at(age_days: float) -> float:
-        target = now - age_days * 86400
+        target = last_ts - age_days * 86400
         prior = [v for ts, v, _ in pts if ts <= target]
         return prior[-1] if prior else vals[0]
 
-    m["pnl_total"] = last_v
     m["pnl_7d"] = last_v - value_at(7)
     m["pnl_30d"] = last_v - value_at(30)
     m["pnl_90d"] = last_v - value_at(90)
@@ -204,7 +413,7 @@ def pnl_series_metrics(points: list[dict], now: float | None = None) -> dict:
         peak = max(peak, v)
         max_dd = max(max_dd, peak - v)
     m["max_dd"] = max_dd
-    recent = [(ts, v) for ts, v, _ in pts if ts >= now - 90 * 86400]
+    recent = [(ts, v) for ts, v, _ in pts if ts >= last_ts - 90 * 86400]
     if len(recent) >= 2:
         peak = -math.inf
         dd90 = 0.0
@@ -224,54 +433,78 @@ def pnl_series_metrics(points: list[dict], now: float | None = None) -> dict:
         wk = [v for v in weeks.values() if abs(v) > 1e-9]
         m["weeks_90d"] = len(wk)
         m["pos_weeks_share"] = sum(1 for v in wk if v > 0) / len(wk) if wk else None
-    m["first_pnl_ts"] = pts[0][0]
-    m["rebates"] = fnum(last_p.get("rebates"))
-    m["rewards"] = fnum(last_p.get("rewards")) + fnum(last_p.get("yield"))
-    m["fees_paid"] = fnum(last_p.get("fees_paid"))
-    m["volume_usdc"] = fnum(last_p.get("volume_usdc"))
-    m["lp_pnl"] = fnum(last_p.get("realized_lp_pnl"))
-    denom = max(abs(last_v), 1.0)
-    m["mm_income_share"] = (m["rebates"] + m["rewards"] + max(m["lp_pnl"], 0.0)) / denom
     return m
+
+
+def income_share(trading_pnl: float | None, wallet_income: float | None, fees_refunded: float | None,
+                 lp_pnl: float | None = None) -> float | None:
+    """Доля дохода не от сделок (ребейты, награды, возвраты комиссий, LP).
+    Возвраты комиссий уже сидят в position_pnl — вычитаем их, чтобы
+    увидеть чистый результат сделок, который можно повторить копией."""
+    if trading_pnl is None and wallet_income is None:
+        return None
+    refunds = max(fnum(fees_refunded), 0.0)
+    other = max(fnum(wallet_income), 0.0) + refunds + max(fnum(lp_pnl), 0.0)
+    skill = fnum(trading_pnl) - refunds
+    return other / max(abs(skill) + other, 1.0)
 
 
 # ------------------------------------------------------ сделки ----
 
+def decisions(rows: list[dict]) -> list[dict]:
+    """Склейка исполнений в решения: один токен и сторона, соседние
+    исполнения не дальше DECISION_GAP_SEC. Сделка в обратную сторону по
+    тому же токену решение обрывает — иначе скальпер «купил-продал-купил»
+    выглядел бы одним спокойным входом."""
+    fills = sorted(rows, key=lambda t: _ts(t.get("timestamp")))
+    out: list[dict] = []
+    open_by_key: dict[tuple, dict] = {}
+    for t in fills:
+        ts = _ts(t.get("timestamp"))
+        side = str(t.get("side") or "").upper()
+        token = str(t.get("token_id") or t.get("asset") or "")
+        key = (token, side)
+        open_by_key.pop((token, "SELL" if side == "BUY" else "BUY"), None)
+        usdc = fnum(t.get("usdc_size")) or fnum(t.get("size")) * fnum(t.get("price"))
+        shares = fnum(t.get("size"))
+        d = open_by_key.get(key)
+        if d is None or ts - d["t1"] > DECISION_GAP_SEC:
+            d = {"t0": ts, "t1": ts, "side": side, "token": key[0], "cond": str(t.get("condition_id") or ""),
+                 "oi": t.get("outcome_index"), "usdc": 0.0, "shares": 0.0, "fills": 0,
+                 "slug": t.get("slug"), "event_slug": t.get("event_slug")}
+            out.append(d)
+            open_by_key[key] = d
+        d["t1"] = ts
+        d["usdc"] += usdc
+        d["shares"] += shares
+        d["fills"] += 1
+    return out
+
+
 def trade_metrics(trades: list[dict], taker_trades: list[dict] | None, resolved: list[dict],
-                  now: float | None = None) -> dict:
+                  now: float | None = None, taker_cap: int | None = None) -> dict:
     now = now or time.time()
     rows = [t for t in trades or [] if str(t.get("type") or "TRADE").upper() == "TRADE"]
     m: dict = {"n_trades_sample": len(rows)}
     if not rows:
         return m
-    # Склейка исполнений одного ордера (одна транзакция) — это одно решение.
-    orders: dict[tuple, dict] = {}
-    for t in rows:
-        key = (str(t.get("transaction_hash") or t.get("timestamp")), str(t.get("token_id")), str(t.get("side")))
-        o = orders.get(key)
-        usdc = fnum(t.get("usdc_size")) or fnum(t.get("size")) * fnum(t.get("price"))
-        if o is None:
-            orders[key] = {"ts": _ts(t.get("timestamp")), "side": str(t.get("side") or "").upper(),
-                           "token": str(t.get("token_id")), "cond": str(t.get("condition_id") or ""),
-                           "oi": t.get("outcome_index"), "usdc": usdc, "shares": fnum(t.get("size")),
-                           "slug": t.get("slug"), "event_slug": t.get("event_slug")}
-        else:
-            o["usdc"] += usdc
-            o["shares"] += fnum(t.get("size"))
-    ol = sorted(orders.values(), key=lambda o: o["ts"])
-    ts_list = [o["ts"] for o in ol if o["ts"]]
-    span_days = max((ts_list[-1] - ts_list[0]) / 86400, 1 / 24) if len(ts_list) >= 2 else None
+    ol = decisions(rows)
+    ts_list = sorted(d["t0"] for d in ol if d["t0"])
+    fill_ts = sorted(_ts(t.get("timestamp")) for t in rows if t.get("timestamp"))
+    span_days = max((fill_ts[-1] - fill_ts[0]) / 86400, 1 / 24) if len(fill_ts) >= 2 else None
     days = defaultdict(int)
-    for o in ol:
-        if o["ts"]:
-            days[int(o["ts"] // 86400)] += 1
+    for d in ol:
+        if d["t0"]:
+            days[int(d["t0"] // 86400)] += 1
     per_day = list(days.values())
     gaps = [b - a for a, b in zip(ts_list, ts_list[1:])]
-    sizes = [o["usdc"] for o in ol if o["usdc"] > 0]
-    buys = [o for o in ol if o["side"] == "BUY"]
-    buy_usdc = sum(o["usdc"] for o in buys)
+    sizes = [d["usdc"] for d in ol if d["usdc"] > 0]
+    buys = [d for d in ol if d["side"] == "BUY"]
+    buy_usdc = sum(d["usdc"] for d in buys)
+    total_usdc = sum(d["usdc"] for d in ol)
     m.update({
         "n_orders_sample": len(ol),
+        "fills_per_order": len(rows) / len(ol) if ol else None,
         "sample_span_days": span_days,
         "orders_per_active_day": _median(per_day),
         "orders_per_day_p90": _pct(per_day, 0.9),
@@ -281,37 +514,39 @@ def trade_metrics(trades: list[dict], taker_trades: list[dict] | None, resolved:
         "median_order_usdc": _median(sizes),
         "p90_order_usdc": _pct(sizes, 0.9),
         "buy_share": len(buys) / len(ol),
-        "avg_buy_price": (sum(o["usdc"] for o in buys) / sum(o["shares"] for o in buys))
-        if buys and sum(o["shares"] for o in buys) > 0 else None,
-        "fast_share_trades": sum(o["usdc"] for o in ol if is_fast(o["slug"], o["event_slug"])) /
-        max(sum(o["usdc"] for o in ol), 1e-9),
-        "last_trade_age_h": (now - ts_list[-1]) / 3600 if ts_list else None,
-        "markets_in_sample": len({o["cond"] for o in ol if o["cond"]}),
+        "avg_buy_price": (buy_usdc / sum(d["shares"] for d in buys))
+        if buys and sum(d["shares"] for d in buys) > 0 else None,
+        "fast_share_trades": sum(d["usdc"] for d in ol if is_fast(d["slug"], d["event_slug"])) /
+        max(total_usdc, 1e-9),
+        "last_trade_age_h": (now - fill_ts[-1]) / 3600 if fill_ts else None,
+        "markets_in_sample": len({d["cond"] for d in ol if d["cond"]}),
     })
     if buy_usdc > 0:
         by_event: dict[str, float] = defaultdict(float)
-        for o in buys:
-            by_event[o["event_slug"] or o["slug"] or o["cond"]] += o["usdc"]
+        for d in buys:
+            by_event[d["event_slug"] or d["slug"] or d["cond"]] += d["usdc"]
         m["top_event_share"] = max(by_event.values()) / buy_usdc
-        mids = [o for o in buys if o["shares"] > 0 and 0.2 <= o["usdc"] / o["shares"] <= 0.8]
-        m["mid_price_share"] = sum(o["usdc"] for o in mids) / buy_usdc
+        mids = [d for d in buys if d["shares"] > 0 and 0.2 <= d["usdc"] / d["shares"] <= 0.8]
+        m["mid_price_share"] = sum(d["usdc"] for d in mids) / buy_usdc
+        fav = [d for d in buys if d["shares"] > 0 and d["usdc"] / d["shares"] >= 0.9]
+        m["fav_buy_share"] = sum(d["usdc"] for d in fav) / buy_usdc
     # Обе стороны одного рынка — признак маркет-мейкера/арбитража.
     sides_by_cond: dict[str, set] = defaultdict(set)
-    for o in buys:
-        if o["cond"] and o["oi"] is not None:
-            sides_by_cond[o["cond"]].add(o["oi"])
+    for d in buys:
+        if d["cond"] and d["oi"] is not None:
+            sides_by_cond[d["cond"]].add(d["oi"])
     if sides_by_cond:
         m["both_sides_share"] = sum(1 for s in sides_by_cond.values() if len(s) > 1) / len(sides_by_cond)
-    # Время удержания: первая покупка токена → первая продажа после неё
-    # (или последнее событие по разрешённой позиции).
+    # Удержание по сделкам (запасной вариант, если в позициях нет first_entry_at):
+    # первая покупка токена → первая продажа после неё (или конец позиции).
     first_buy: dict[str, float] = {}
     first_sell: dict[str, float] = {}
-    for o in ol:
-        if o["side"] == "BUY":
-            first_buy.setdefault(o["token"], o["ts"])
-        elif o["side"] == "SELL" and o["token"] in first_buy and o["token"] not in first_sell:
-            first_sell[o["token"]] = o["ts"]
-    end_by_token = {str(p.get("token_id")): _ts(p.get("last_event_at")) for p in resolved or []}
+    for d in sorted(ol, key=lambda x: x["t0"]):
+        if d["side"] == "BUY":
+            first_buy.setdefault(d["token"], d["t0"])
+        elif d["side"] == "SELL" and d["token"] in first_buy and d["token"] not in first_sell:
+            first_sell[d["token"]] = d["t0"]
+    end_by_token = {str(p.get("token_id")): settle_ts(p) for p in resolved or []}
     holds = []
     sold_early = 0
     for tok, t0 in first_buy.items():
@@ -322,17 +557,23 @@ def trade_metrics(trades: list[dict], taker_trades: list[dict] | None, resolved:
             holds.append(max(0.0, end_by_token[tok] - t0))
     if holds:
         m["median_hold_h"] = _median(holds) / 3600.0
-        m["short_hold_share"] = sum(1 for h in holds if h < 1800) / len(holds)
+        m["short_hold_share"] = sum(1 for h in holds if h < 3600) / len(holds)
+        m["hold_source"] = "trades"
     if first_buy:
         m["sell_before_end_share"] = sold_early / len(first_buy)
-    # Доля мейкерских сделок: сравниваем тейкерские сделки с общими за то же окно.
-    if taker_trades is not None and ts_list:
-        lo = ts_list[0]
-        tk = [t for t in taker_trades if _ts(t.get("timestamp")) >= lo]
-        if rows:
-            all_in = [t for t in rows if _ts(t.get("timestamp")) >= lo]
-            if all_in:
-                m["taker_share"] = min(1.0, len(tk) / len(all_in))
+    # Доля тейкерских сделок — по деньгам, а не по строкам: одна лимитка,
+    # исполненная 50 мелкими кусками, иначе выглядит как 50 «мейкерских сделок».
+    if taker_trades is not None and fill_ts:
+        lo = fill_ts[0]
+        tk_ts = [_ts(t.get("timestamp")) for t in taker_trades if t.get("timestamp")]
+        if taker_cap and len(taker_trades) >= taker_cap and tk_ts:
+            lo = max(lo, min(tk_ts))
+        tk_usd = sum(fnum(t.get("usdc_size")) or fnum(t.get("size")) * fnum(t.get("price"))
+                     for t in taker_trades if _ts(t.get("timestamp")) >= lo)
+        all_usd = sum(fnum(t.get("usdc_size")) or fnum(t.get("size")) * fnum(t.get("price"))
+                      for t in rows if _ts(t.get("timestamp")) >= lo)
+        if all_usd > 0:
+            m["taker_share"] = min(1.0, tk_usd / all_usd)
     return m
 
 
@@ -360,23 +601,31 @@ def score_wallet(m: dict) -> tuple[float, str, list[str]]:
     if n < 20:
         hard.append(f"мало закрытых ставок ({n} < 20) — не отличить навык от удачи")
     opd = m.get("orders_per_active_day")
-    if (opd is not None and opd > 60) or (m.get("burst_share") or 0) > 0.5:
-        hard.append(f"похоже на бота: ~{opd or 0:.0f} ордеров в активный день, "
-                    f"{(m.get('burst_share') or 0) * 100:.0f}% подряд быстрее 10 с")
+    p90 = m.get("orders_per_day_p90")
+    burst = m.get("burst_share") or 0
+    if (opd is not None and opd > 60) or (p90 is not None and p90 > 200) or burst > 0.5:
+        hard.append(f"похоже на бота: ~{opd or 0:.0f} решений в активный день, "
+                    f"{burst * 100:.0f}% подряд быстрее 10 с")
     fast = max(m.get("fast_share_trades") or 0, m.get("fast_share_pos") or 0)
     if fast > 0.5:
         hard.append(f"{fast * 100:.0f}% денег в быстрых крипто-рынках (5м/15м/час) — не успеть")
-    mm = max(m.get("both_sides_share") or 0, 0)
-    if mm > 0.35 or (m.get("mm_income_share") or 0) > 0.35:
-        hard.append("маркет-мейкер/арбитраж (покупает обе стороны или живёт на ребейтах)")
-    if (m.get("taker_share") is not None and m["taker_share"] < 0.15 and (m.get("n_orders_sample") or 0) > 50):
-        hard.append(f"почти все сделки — лимитками-мейкером ({(1 - m['taker_share']) * 100:.0f}%)")
+    if (m.get("both_sides_share") or 0) > 0.35:
+        hard.append(f"маркет-мейкер/арбитраж: покупает обе стороны в {m['both_sides_share'] * 100:.0f}% рынков")
+    inc = m.get("mm_income_share")
+    if inc is not None and inc > 0.35:
+        hard.append(f"живёт на ребейтах/наградах/возвратах комиссий ({inc * 100:.0f}% дохода) — копией не повторить")
     if (m.get("top1_share") or 0) > 0.5 or ((m.get("pnl_ex_top3") or 0) <= 0 and n >= 20):
         hard.append("прибыль держится на 1-3 удачных ставках")
+    bws = m.get("biggest_win_share")
+    if bws is not None and bws > 0.6:
+        hard.append(f"лучшая ставка = {bws * 100:.0f}% всей прибыли")
     roi = m.get("roi_resolved")
     if roi is not None and roi <= 0:
         hard.append(f"в минусе по закрытым ставкам (ROI {roi * 100:.1f}%)")
-    if (m.get("pnl_90d") is not None and m["pnl_90d"] < 0):
+    atp = m.get("all_time_pnl")
+    if atp is not None and atp < 0:
+        hard.append(f"за всё время в минусе ({atp:+,.0f}$)".replace(",", " "))
+    if m.get("pnl_90d") is not None and m["pnl_90d"] < 0:
         hard.append(f"последние 90 дней в минусе ({m['pnl_90d']:+.0f}$)")
     age = m.get("last_trade_age_h")
     if age is not None and age > 14 * 24:
@@ -384,6 +633,9 @@ def score_wallet(m: dict) -> tuple[float, str, list[str]]:
     hold = m.get("median_hold_h")
     if hold is not None and hold < 0.5:
         hard.append(f"держит позиции ~{hold * 60:.0f} мин — скальпер, не успеть")
+    short = m.get("short_hold_share")
+    if m.get("hold_source") == "positions" and short is not None and short > 0.5:
+        hard.append(f"{short * 100:.0f}% денег в позициях короче часа — не успеть")
 
     # --- баллы ---
     z = m.get("z_bets") or 0.0
@@ -393,9 +645,9 @@ def score_wallet(m: dict) -> tuple[float, str, list[str]]:
     pw = m.get("pos_weeks_share")
     s_weeks = 10 * _clip01(((pw if pw is not None else 0.5) - 0.45) / 0.35)
     dd = m.get("max_dd_90d")
-    p90 = m.get("pnl_90d")
-    if dd is not None and p90 and p90 > 0:
-        s_dd = 10 * _clip01(1.0 - (dd / p90 - 0.2) / 0.8)
+    p90d = m.get("pnl_90d")
+    if dd is not None and p90d and p90d > 0:
+        s_dd = 10 * _clip01(1.0 - (dd / p90d - 0.2) / 0.8)
     else:
         s_dd = 3.0
     if hold is None:
@@ -418,6 +670,11 @@ def score_wallet(m: dict) -> tuple[float, str, list[str]]:
     if (m.get("longshot_share") or 0) > 0.5:
         score -= 5
         reasons.append("в основном лотерейки ≤0.10 — результат очень шумный")
+    tk = m.get("taker_share")
+    if tk is not None and tk < 0.15 and (m.get("n_orders_sample") or 0) > 30:
+        score -= 5
+        reasons.append(f"входит в основном лимитками (по рынку лишь {tk * 100:.0f}% объёма) — "
+                       "копия по рынку будет на спред хуже их цены")
     if d3 is not None and d3 > 2:
         reasons.append(f"после их входа цена за 3 с уходит на {d3:.1f}¢ — копия будет хуже")
     if z >= 2 and zu >= 1.5:
@@ -426,6 +683,9 @@ def score_wallet(m: dict) -> tuple[float, str, list[str]]:
         reasons.append(f"edge {m.get('edge_cents', 0):+.1f}¢ на ставку, z={z:.1f} — пока не доказано")
     if hold is not None and hold >= 24:
         reasons.append(f"держит позиции ~{hold / 24:.1f} дн. — копировать легко")
+    lag = m.get("pnl_lag_days")
+    if lag is not None and lag > PNL_STALE_DAYS:
+        reasons.append(f"PnL у Polymarket обновлён {lag:.0f} дн. назад — окна 7/30/90 дн. на эту дату")
     score = max(0.0, min(100.0, score))
     if hard:
         verdict = "❌ не копировать"
@@ -440,25 +700,46 @@ def score_wallet(m: dict) -> tuple[float, str, list[str]]:
 
 
 def analyze_wallet(raw: dict, now: float | None = None) -> dict:
-    """raw: stats, pnl_points, closed, redeemable, open, trades, taker_trades, drift."""
+    """raw: stats, pnl_points, closed, redeemable, open, trades, taker_trades, drift, caps."""
     now = now or time.time()
-    resolved = resolved_positions(raw.get("closed") or [], raw.get("redeemable") or [])
+    caps = raw.get("caps") or {}
+    closed = raw.get("closed") or []
+    redeem = raw.get("redeemable") or []
+    window = sample_window(closed, redeem, caps)
+    resolved = resolved_positions(closed, redeem)
     m: dict = {}
-    m.update(edge_metrics(resolved, now))
+    m.update(edge_metrics(resolved, now, window))
+    m["window_days"] = (now - window) / 86400 if window else None
     m.update(pnl_series_metrics(raw.get("pnl_points") or [], now))
-    m.update(trade_metrics(raw.get("trades") or [], raw.get("taker_trades"), resolved, now))
+    m.update(trade_metrics(raw.get("trades") or [], raw.get("taker_trades"), resolved, now,
+                           taker_cap=caps.get("taker")))
+    m.update(hold_metrics(closed))
     m.update(drift_metrics(raw.get("drift") or []))
-    stats = raw.get("stats") or {}
-    m["all_time_pnl"] = fnum(stats.get("all_time_pnl")) if stats.get("all_time_pnl") is not None else m.get("pnl_total")
-    m["trades_lifetime"] = stats.get("trades")
-    jd = stats.get("join_date")
-    if jd:
-        from src.markets import parse_iso
-        jts = parse_iso(jd) if isinstance(jd, str) else _ts(jd)
-        m["account_age_days"] = (now - jts) / 86400 if jts else None
-    open_pos = raw.get("open") or []
+    ss = stats_summary(raw.get("stats"))
+    m["all_time_pnl"] = ss["trading_pnl"] if ss["trading_pnl"] is not None else m.get("pnl_total")
+    m["economic_pnl"] = ss["economic_pnl"] if ss["economic_pnl"] is not None else m.get("economic_pnl_series")
+    wallet_income = ss["wallet_income"] if ss["wallet_income"] is not None else m.get("wallet_income")
+    refunds = ss["fees_refunded"] if ss["fees_refunded"] is not None else m.get("fees_refunded")
+    m["wallet_income"] = wallet_income
+    m["fees_refunded"] = refunds
+    m["mm_income_share"] = income_share(m["all_time_pnl"], wallet_income, refunds, m.get("lp_pnl"))
+    m["biggest_win"] = ss["biggest_win"]
+    atp = m["all_time_pnl"]
+    m["biggest_win_share"] = (ss["biggest_win"] / atp) if (ss["biggest_win"] is not None and atp and atp > 0) else None
+    m["trades_lifetime"] = ss["markets_traded"]
+    m["trade_count_lifetime"] = ss["trade_count"]
+    m["volume_lifetime"] = ss["volume_usdc"] if ss["volume_usdc"] is not None else m.get("volume_usdc")
+    if m["volume_lifetime"] and atp is not None:
+        m["roi_on_volume"] = atp / m["volume_lifetime"]
+    if ss["join_ts"]:
+        m["account_age_days"] = (now - ss["join_ts"]) / 86400
+    # OPEN в v2 включает и разрешённые, но не погашенные позиции — их не
+    # считаем «открытыми»: они уже в статистике ставок.
+    open_pos = [p for p in raw.get("open") or [] if not _truthy(p.get("redeemable"))]
     m["open_positions"] = len(open_pos)
     m["open_value"] = sum(fnum(p.get("current_value")) for p in open_pos)
+    m["open_cost"] = sum(fnum(p.get("entry_cost_usdc")) for p in open_pos)
+    m["open_upnl"] = sum(fnum(p.get("unrealized_pnl")) for p in open_pos)
     score, verdict, reasons = score_wallet(m)
     m["score"] = score
     m["verdict"] = verdict

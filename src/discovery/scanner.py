@@ -29,7 +29,7 @@ import zipfile
 from config import settings
 from src import db, notifier, state
 from src.discovery import collect
-from src.discovery.analyze import analyze_wallet, drift_metrics, score_wallet
+from src.discovery.analyze import analyze_wallet, drift_metrics, position_cost, score_wallet, stats_summary
 from src.util import esc, fnum, money, short_addr
 
 log = logging.getLogger("discovery")
@@ -40,47 +40,61 @@ MIN_ACCOUNT_DAYS = 21
 
 WALLET_COLUMNS = [
     "rank", "wallet", "name", "sources", "score", "verdict", "reasons",
-    "all_time_pnl", "pnl_7d", "pnl_30d", "pnl_90d", "n_resolved", "roi_resolved", "win_rate", "avg_entry",
+    "all_time_pnl", "economic_pnl", "pnl_7d", "pnl_30d", "pnl_90d", "pnl_as_of", "pnl_lag_days",
+    "volume_lifetime", "roi_on_volume", "biggest_win", "biggest_win_share",
+    "n_resolved", "window_days", "roi_resolved", "win_rate", "avg_entry",
     "edge_cents", "z_bets", "z_usd", "profit_factor", "top1_share", "top3_share", "pnl_ex_top3", "median_bet",
     "fav_share", "longshot_share", "fast_share_pos", "fast_share_trades", "n_resolved_30d", "roi_resolved_30d",
     "edge_by_price", "categories", "main_category", "max_dd", "max_dd_90d", "daily_sharpe", "best_day_share",
-    "pos_weeks_share", "weeks_90d", "mm_income_share", "rebates", "rewards", "fees_paid", "volume_usdc",
-    "n_trades_sample", "n_orders_sample", "sample_span_days", "orders_per_active_day", "orders_per_day_p90",
-    "active_days_sample", "median_gap_min", "burst_share", "median_order_usdc", "p90_order_usdc", "buy_share",
-    "avg_buy_price", "last_trade_age_h", "markets_in_sample", "top_event_share", "mid_price_share",
-    "both_sides_share", "median_hold_h", "short_hold_share", "sell_before_end_share", "taker_share",
+    "pos_weeks_share", "weeks_90d", "mm_income_share", "wallet_income", "fees_refunded", "rebates", "rewards",
+    "fees_paid", "n_trades_sample", "n_orders_sample", "fills_per_order", "sample_span_days",
+    "orders_per_active_day", "orders_per_day_p90", "active_days_sample", "median_gap_min", "burst_share",
+    "median_order_usdc", "p90_order_usdc", "buy_share", "avg_buy_price", "fav_buy_share", "last_trade_age_h",
+    "markets_in_sample", "top_event_share", "mid_price_share", "both_sides_share", "median_hold_h",
+    "short_hold_share", "hold_source", "sell_before_end_share", "taker_share",
     "drift_samples", "drift_3s_cents", "drift_60s_cents", "account_age_days", "trades_lifetime",
-    "open_positions", "open_value", "profile_url",
+    "trade_count_lifetime", "open_positions", "open_value", "open_cost", "open_upnl", "profile_url",
 ]
 CLOSED_COLS = ["wallet", "src", "token_id", "condition_id", "title", "slug", "event_slug", "outcome", "avg_price",
-               "entry_cost_usdc", "realized_pnl", "unrealized_pnl", "total_pnl", "current_price", "last_event_at"]
+               "total_size", "cost_usdc", "realized_pnl", "unrealized_pnl", "total_pnl", "percent_realized_pnl",
+               "current_size", "current_price", "first_entry_at", "last_event_at", "end_date", "status"]
 TRADE_COLS = ["wallet", "timestamp", "side", "price", "size", "usdc_size", "token_id", "condition_id", "slug",
               "event_slug", "outcome", "outcome_index", "transaction_hash"]
 OPEN_COLS = ["wallet", "token_id", "condition_id", "title", "slug", "event_slug", "outcome", "current_size",
-             "avg_price", "entry_cost_usdc", "current_price", "current_value", "unrealized_pnl", "last_event_at"]
-PNL_COLS = ["wallet", "timestamp", "total_pnl", "cumulative_pnl", "realized_total_pnl", "unrealized_total_pnl",
-            "volume_usdc", "trade_count", "fees_paid", "rebates", "rewards", "realized_lp_pnl", "yield"]
+             "total_size", "avg_price", "entry_cost_usdc", "current_price", "current_value", "unrealized_pnl",
+             "realized_pnl", "redeemable", "first_entry_at", "last_event_at", "end_date"]
+PNL_COLS = ["wallet", "timestamp", "position_pnl", "realized_pnl", "unrealized_pnl", "economic_pnl",
+            "wallet_income", "fees_refunded", "fees_paid", "volume_usdc", "trade_count"]
 # Сколько сырых строк по кошельку держим в памяти/кладём в архив.
-CAP_TRADES, CAP_CLOSED, CAP_OPEN, CAP_PNL = 800, 600, 200, 500
+CAP_TRADES, CAP_CLOSED, CAP_REDEEM, CAP_OPEN, CAP_PNL = 800, 700, 300, 200, 400
 
 README = """Архив поиска кошельков для копирования (Polymarket)
 
 wallets.csv — по строке на разобранный кошелёк, отсортировано по score.
   score 0-100, verdict: ✅ кандидат / 🟡 наблюдать / ⚪ слабый / ❌ не копировать (+ reasons).
+  all_time_pnl — торговый PnL за всё время (position_pnl: сделки после комиссий, без ребейтов и наград);
+  economic_pnl — вместе с ребейтами/наградами. pnl_7d/30d/90d — изменение торгового PnL,
+  считается от pnl_as_of (Polymarket иногда обновляет PnL с опозданием — pnl_lag_days).
+  roi_on_volume — торговый PnL / оборот за всё время. biggest_win_share — лучшая ставка / весь PnL.
+  trades_lifetime — в скольких рынках торговал за всё время; trade_count_lifetime — сколько сделок.
   edge_cents  — средний «перевес» ставки: (итог за акцию − цена входа), в центах. >0 = лучше рынка.
   z_bets      — значимость edge по ставкам (≥2 — навык вероятнее удачи); z_usd — то же в долларах.
-  roi_resolved — PnL / вложено по закрытым + разрешённым позициям (включая непогашенные проигрыши).
+  roi_resolved — PnL / вложено по закрытым + разрешённым позициям (включая непогашенные проигрыши)
+               за window_days — окно, в котором выборка позиций полная.
   top1_share  — доля лучшей ставки во всей прибыли; pnl_ex_top3 — PnL без 3 лучших ставок.
   fav_share / longshot_share — доля денег во входах ≥0.90 / ≤0.10.
   fast_share_* — доля в быстрых крипто-рынках (5м/15м/час) — их не скопировать.
-  orders_per_active_day, burst_share (сделки чаще 10 с) — признаки бота.
-  median_hold_h — медианное удержание позиции, часы. taker_share — доля тейкерских сделок.
+  n_orders_sample — решения: исполнения одного токена и стороны ближе 10 мин склеены в одно.
+  orders_per_active_day, burst_share (решения чаще 10 с) — признаки бота.
+  median_hold_h — медианное удержание позиции, часы (hold_source: по позициям или по сделкам).
+  taker_share — доля объёма, купленного/проданного по рынку (остальное — их лимитки).
   both_sides_share — доля рынков, где покупал обе стороны (маркет-мейкинг/арбитраж).
-  mm_income_share — доля ребейтов/наград в итоговом PnL.
+  mm_income_share — доля дохода не от сделок (ребейты, награды, возвраты комиссий).
   drift_3s/60s_cents — как уходит цена через 3/60 с после их покупки (сколько потеряет копирующий).
   pos_weeks_share — доля прибыльных недель за 90 дней; max_dd_90d — макс. просадка за 90 дней, $.
-  edge_by_price — edge по корзинам цены входа; categories — доля денег и ROI по категориям.
-closed_positions.csv, trades.csv, open_positions.csv, pnl_daily.csv, drift.csv — сырьё по лучшим кошелькам.
+  edge_by_price — edge, ROI и число ставок по корзинам цены входа; categories — доля денег, ROI, число.
+closed_positions.csv — закрытые и непогашенные позиции (cost_usdc — вложено за всё время),
+trades.csv, open_positions.csv, pnl_daily.csv, drift.csv — сырьё по лучшим кошелькам.
 """
 
 progress: dict = {"running": False, "stage": "", "done": 0, "total": 0, "started": 0.0, "mode": ""}
@@ -171,7 +185,7 @@ async def collect_candidates(full: bool, extra: list[str] | None = None) -> dict
 
 
 def _priority(c: dict, stats: dict | None) -> float:
-    pnl = fnum((stats or {}).get("all_time_pnl"), c.get("lb_pnl") or 0.0)
+    pnl = collect.stats_pnl(stats, c.get("lb_pnl") or 0.0)
     p = math.log10(max(pnl, 1.0))
     srcs = c["sources"]
     p += 0.6 * len(srcs)
@@ -204,16 +218,13 @@ async def prefilter(cands: dict[str, dict], keep: int) -> list[tuple[dict, dict 
             await _report_progress()
             forced = "manual" in c["sources"] or "copied" in c["sources"]
             if not forced:
-                pnl = fnum((st or {}).get("all_time_pnl"), c.get("lb_pnl") or 0.0)
+                pnl = collect.stats_pnl(st, c.get("lb_pnl") or 0.0)
                 trades = fnum((st or {}).get("trades"), MIN_TRADES)
                 if pnl < MIN_PNL or trades < MIN_TRADES:
                     return
-                jd = (st or {}).get("join_date")
-                if jd:
-                    from src.markets import parse_iso
-                    jts = parse_iso(jd) if isinstance(jd, str) else fnum(jd)
-                    if jts and now - jts < MIN_ACCOUNT_DAYS * 86400:
-                        return
+                jts = stats_summary(st)["join_ts"]
+                if jts and now - jts < MIN_ACCOUNT_DAYS * 86400:
+                    return
             out.append((c, st))
 
     await asyncio.gather(*(one(c) for c in items))
@@ -238,25 +249,42 @@ def _compact(rows: list[dict], cols: list[str], wallet: str, **extra) -> list[li
     return out
 
 
+def _name_from(raw: dict) -> str:
+    for t in raw.get("trades") or []:
+        name = t.get("name") or t.get("pseudonym")
+        if name and not str(name).lower().startswith("0x"):
+            return str(name)
+    return ""
+
+
+def _with_cost(rows: list[dict]) -> list[dict]:
+    out = []
+    for r in rows:
+        r2 = dict(r)
+        r2["cost_usdc"] = round(position_cost(r), 4)
+        out.append(r2)
+    return out
+
+
 def _slim(raw: dict, wallet: str) -> dict:
     """Сжимаем сырьё до строк архива (списки значений, а не словари) —
     иначе 60 кошельков × тысячи строк съедают сотни МБ памяти."""
     redeem = raw.get("redeemable") or []
     return {
-        "closed": _compact((raw.get("closed") or [])[:CAP_CLOSED], CLOSED_COLS, wallet, src="closed")
-        + _compact(redeem[:CAP_CLOSED // 2], CLOSED_COLS, wallet, src="redeemable"),
+        "closed": _compact(_with_cost((raw.get("closed") or [])[:CAP_CLOSED]), CLOSED_COLS, wallet, src="closed")
+        + _compact(_with_cost(redeem[:CAP_REDEEM]), CLOSED_COLS, wallet, src="redeemable"),
         "trades": _compact((raw.get("trades") or [])[:CAP_TRADES], TRADE_COLS, wallet),
         "open": _compact((raw.get("open") or [])[:CAP_OPEN], OPEN_COLS, wallet),
         "pnl": _compact((raw.get("pnl_points") or [])[-CAP_PNL:], PNL_COLS, wallet),
         # Для замера проскальзывания — последние покупки (полные поля).
-        "buys": [t for t in (raw.get("trades") or []) if str(t.get("side") or "").upper() == "BUY"][:40],
+        "buys": [t for t in (raw.get("trades") or []) if str(t.get("side") or "").upper() == "BUY"][:300],
         "drift": [],
     }
 
 
 async def deep_analyze(selected: list[tuple[dict, dict | None]], detail_n: int) -> tuple[list[dict], dict]:
     results: list[dict] = []
-    keep_raw: list[tuple[float, int, str]] = []     # min-heap (score, seq, wallet)
+    keep_raw: list[tuple[int, float, int, str]] = []     # min-heap (не ❌, score, seq, wallet)
     raw_store: dict[str, dict] = {}
     seq = 0
     progress.update(stage="глубокий разбор", done=0, total=len(selected))
@@ -274,17 +302,18 @@ async def deep_analyze(selected: list[tuple[dict, dict | None]], detail_n: int) 
                 log.warning("Разбор %s: %s", c["wallet"][:10], exc)
                 progress["done"] += 1
                 return
-            m.update({"wallet": c["wallet"], "name": c.get("name") or (raw["stats"] or {}).get("name") or "",
+            m.update({"wallet": c["wallet"], "name": c.get("name") or _name_from(raw),
                       "sources": ",".join(sorted(c["sources"])),
                       "profile_url": f"https://polymarket.com/profile/{c['wallet']}"})
             results.append(m)
             seq += 1
-            item = (m["score"], seq, c["wallet"])
+            # Сырьё в архив — сначала тем, кто не отбракован, потом по score.
+            item = (0 if m["verdict"].startswith("❌") else 1, m["score"], seq, c["wallet"])
             if len(keep_raw) < detail_n:
                 heapq.heappush(keep_raw, item)
                 raw_store[c["wallet"]] = _slim(raw, c["wallet"])
             elif item > keep_raw[0]:
-                _, _, evicted = heapq.heapreplace(keep_raw, item)
+                _, _, _, evicted = heapq.heapreplace(keep_raw, item)
                 raw_store.pop(evicted, None)
                 raw_store[c["wallet"]] = _slim(raw, c["wallet"])
             del raw
@@ -316,6 +345,10 @@ async def add_drift(results: list[dict], raw_store: dict, n: int) -> None:
 
 # ------------------------------------------------------------ архив ----
 
+def _pct_or_dash(v) -> str:
+    return "—" if v is None else f"{fnum(v) * 100:.0f}%"
+
+
 def _fmt(v):
     if isinstance(v, float):
         if math.isinf(v):
@@ -328,7 +361,7 @@ def build_archive(results: list[dict], raw_store: dict, meta: dict) -> str:
     os.makedirs(settings.REPORTS_DIR, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M", time.gmtime())
     path = os.path.join(settings.REPORTS_DIR, f"wallets_{stamp}.zip")
-    ranked = sorted(results, key=lambda m: (-m["score"], m["wallet"]))
+    ranked = _ranked(results)
     for i, m in enumerate(ranked, 1):
         m["rank"] = i
 
@@ -358,11 +391,13 @@ def build_archive(results: list[dict], raw_store: dict, meta: dict) -> str:
              f"время: {meta.get('minutes', 0):.0f} мин", ""]
     for m in ranked[:25]:
         lines.append(f"#{m['rank']} {m['wallet']} {m.get('name') or ''}")
-        lines.append(f"   {m['verdict']} score {m['score']} | PnL всего {fnum(m.get('all_time_pnl')):,.0f}$, "
-                     f"30д {fnum(m.get('pnl_30d')):+,.0f}$ | ставок {m.get('n_resolved')} "
+        lines.append(f"   {m['verdict']} score {m['score']} | торговый PnL всего {fnum(m.get('all_time_pnl')):,.0f}$, "
+                     f"30д {fnum(m.get('pnl_30d')):+,.0f}$, 90д {fnum(m.get('pnl_90d')):+,.0f}$ | "
+                     f"ставок {m.get('n_resolved')} за {fnum(m.get('window_days')):.0f} дн. "
                      f"ROI {fnum(m.get('roi_resolved')) * 100:+.1f}% edge {fnum(m.get('edge_cents')):+.1f}¢ "
                      f"z={fnum(m.get('z_bets')):.1f} | удержание {fnum(m.get('median_hold_h')):.1f}ч | "
-                     f"ордеров/день {fnum(m.get('orders_per_active_day')):.1f}")
+                     f"решений/день {fnum(m.get('orders_per_active_day')):.1f} | "
+                     f"по рынку {_pct_or_dash(m.get('taker_share'))} | {m.get('main_category') or '—'}")
         lines.append(f"   {m.get('reasons')}")
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("wallets.csv", csv_text(WALLET_COLUMNS, wallet_rows))
@@ -377,14 +412,27 @@ def build_archive(results: list[dict], raw_store: dict, meta: dict) -> str:
     return path
 
 
+def _verdict_order(m: dict) -> int:
+    v = str(m.get("verdict") or "")
+    for i, mark in enumerate(("✅", "🟡", "⚪")):
+        if v.startswith(mark):
+            return i
+    return 3
+
+
+def _ranked(results: list[dict]) -> list[dict]:
+    """Сначала кандидаты, потом «наблюдать», «слабые» и только потом
+    отбракованные — внутри группы по score."""
+    return sorted(results, key=lambda m: (_verdict_order(m), -m["score"], m["wallet"]))
+
+
 def _top_payload(results: list[dict], n: int = 10) -> list[dict]:
-    ranked = sorted(results, key=lambda m: -m["score"])
     out = []
-    for m in ranked[:n]:
+    for m in _ranked(results)[:n]:
         out.append({k: _fmt(m.get(k)) for k in ("wallet", "name", "score", "verdict", "reasons", "all_time_pnl",
-                                                "pnl_30d", "n_resolved", "roi_resolved", "edge_cents", "z_bets",
-                                                "median_hold_h", "orders_per_active_day", "drift_3s_cents",
-                                                "main_category")})
+                                                "pnl_30d", "pnl_90d", "n_resolved", "roi_resolved", "edge_cents",
+                                                "z_bets", "median_hold_h", "orders_per_active_day",
+                                                "drift_3s_cents", "main_category", "taker_share")})
     return out
 
 
@@ -446,7 +494,7 @@ async def analyze_one(address: str) -> tuple[dict, str] | None:
     """Разбор одного кошелька по запросу: метрики + маленький архив."""
     raw = await collect.fetch_wallet(address, with_drift=True)
     m = analyze_wallet(raw)
-    m.update({"wallet": address, "name": (raw.get("stats") or {}).get("name") or "", "sources": "manual",
+    m.update({"wallet": address, "name": _name_from(raw), "sources": "manual",
               "profile_url": f"https://polymarket.com/profile/{address}"})
     slim = _slim(raw, address)
     slim["drift"] = raw.get("drift") or []
@@ -462,18 +510,23 @@ def wallet_card(m: dict) -> str:
     def num(v, fmt="{:.1f}"):
         return "—" if v is None else fmt.format(fnum(v))
 
+    lag = m.get("pnl_lag_days")
+    lag_txt = f" (данные PnL на {lag:.0f} дн. назад)" if lag is not None and lag > 3 else ""
     return (
         f"<b>{esc(m.get('name') or short_addr(m['wallet']))}</b> <code>{m['wallet']}</code>\n"
         f"{m['verdict']} · score {m['score']}\n"
-        f"PnL: всего {money(fnum(m.get('all_time_pnl')))}, 30д {money(fnum(m.get('pnl_30d')), True)}, "
-        f"90д {money(fnum(m.get('pnl_90d')), True)}\n"
-        f"Ставок закрыто: {m.get('n_resolved') or 0}, ROI {pct(m.get('roi_resolved'))}, "
-        f"винрейт {pct(m.get('win_rate'))}, средний вход {num(m.get('avg_entry'), '{:.2f}')}\n"
+        f"Торговый PnL: всего {money(fnum(m.get('all_time_pnl')))}, 30д {money(fnum(m.get('pnl_30d')), True)}, "
+        f"90д {money(fnum(m.get('pnl_90d')), True)}{lag_txt}\n"
+        f"Оборот {money(fnum(m.get('volume_lifetime')))}, PnL/оборот {pct(m.get('roi_on_volume'))} · "
+        f"лучшая ставка = {pct(m.get('biggest_win_share'))} PnL · ребейты/награды {pct(m.get('mm_income_share'))}\n"
+        f"Ставок разобрано: {m.get('n_resolved') or 0} за {num(m.get('window_days'), '{:.0f}')} дн., "
+        f"ROI {pct(m.get('roi_resolved'))}, винрейт {pct(m.get('win_rate'))}, "
+        f"средний вход {num(m.get('avg_entry'), '{:.2f}')}\n"
         f"Edge: {num(m.get('edge_cents'), '{:+.1f}')}¢ на ставку, z={num(m.get('z_bets'))} "
         f"(z$={num(m.get('z_usd'))})\n"
-        f"Лучшая ставка = {pct(m.get('top1_share'))} прибыли · прибыльных недель {pct(m.get('pos_weeks_share'))}\n"
-        f"Ордеров в день: {num(m.get('orders_per_active_day'))} · удержание {num(m.get('median_hold_h'))} ч · "
-        f"тейкер {pct(m.get('taker_share'))}\n"
+        f"Лучшая из разобранных = {pct(m.get('top1_share'))} прибыли · прибыльных недель {pct(m.get('pos_weeks_share'))}\n"
+        f"Решений в день: {num(m.get('orders_per_active_day'))} · удержание {num(m.get('median_hold_h'))} ч · "
+        f"по рынку {pct(m.get('taker_share'))} объёма\n"
         f"Быстрые рынки: {pct(max(fnum(m.get('fast_share_trades')), fnum(m.get('fast_share_pos'))))} · "
         f"категории: {esc(m.get('categories') or '—')}\n"
         f"Цена после их входа: 3с {num(m.get('drift_3s_cents'), '{:+.1f}')}¢, "
