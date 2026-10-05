@@ -56,7 +56,7 @@ class WalletCfg:
     size_pct: float = 10.0
     size_fixed: float = 5.0
     max_usdc: float = 25.0           # потолок одной нашей сделки, $
-    min_target_usdc: float = 10.0    # их сделки меньше этого — шум, не копируем
+    min_target_usdc: float = 10.0    # их исполнения меньше этого копятся по рынку до порога
     accumulate_small: bool = True    # копить доли < $1, пока не наберётся мин. ордер
     # Исполнение
     max_slip_cents: float = 2.0      # не дороже их цены больше чем на N центов…

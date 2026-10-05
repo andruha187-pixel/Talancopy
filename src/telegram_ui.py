@@ -218,7 +218,8 @@ def wallet_text(w, s_paper: dict | None = None, s_live: dict | None = None) -> s
         f"<a href=\"https://polymarket.com/profile/{w.address}\">профиль на Polymarket</a>",
         "",
         f"💵 Размер: {_size_line(w)}",
-        f"Их сделки меньше {_fv(w.min_target_usdc, '$')} — не копирую; доли &lt;$1 "
+        f"Их сделки меньше {_fv(w.min_target_usdc, '$')} копятся по рынку (серия с паузами ≤10 мин), "
+        f"копирую, когда наберётся; доли &lt;$1 "
         f"{'копятся до $1' if w.accumulate_small else 'пропускаются'}",
         f"🎯 Цена: не хуже их +{_fv(w.max_slip_cents, '¢')} и +{_fv(w.max_slip_pct, '%')}; "
         f"входы только {w.min_price:g}–{w.max_price:g}",
@@ -602,7 +603,8 @@ def _top_text_and_markup(top: list[dict]) -> tuple[str, InlineKeyboardMarkup]:
         lines.append(
             f"\n<b>#{i}</b> {esc(m.get('name') or short_addr(m['wallet']))} — {m.get('verdict')} · score {m.get('score')}\n"
             f"<code>{m['wallet']}</code>\n"
-            f"PnL {money(fnum(m.get('all_time_pnl')))} (30д {money(fnum(m.get('pnl_30d')), True)}), "
+            f"торг. PnL {money(fnum(m.get('all_time_pnl')))} (30д {money(fnum(m.get('pnl_30d')), True)}, "
+            f"90д {money(fnum(m.get('pnl_90d')), True)}), "
             f"ставок {m.get('n_resolved') or 0}, ROI {fnum(m.get('roi_resolved')) * 100:+.0f}%, "
             f"edge {fnum(m.get('edge_cents')):+.1f}¢ z={fnum(m.get('z_bets')):.1f}, "
             f"удержание {fnum(m.get('median_hold_h')):.0f}ч, {esc(m.get('main_category') or '')}\n"

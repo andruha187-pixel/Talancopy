@@ -29,6 +29,10 @@ log = logging.getLogger("copier")
 
 MIN_ORDER_USDC = 1.0
 SMALL_ACC_TTL = 900
+# Их мелкие исполнения одного токена (лимитку часто «съедают» десятками
+# кусков по $1-20) копятся, пока не наберут порог «их сделка меньше — не
+# копирую». Пауза между исполнениями дольше этого — новая серия.
+TARGET_ACC_GAP = 600
 
 REASON_RU = {
     "copy": "копия входа", "mirror": "зеркальная продажа", "sl": "стоп-лосс", "tp": "тейк-профит",
@@ -41,6 +45,7 @@ holdings: dict[str, dict[str, float]] = {}
 _holdings_ts: dict[str, float] = {}
 _recent_fills: dict[str, deque] = {}
 _small_acc: dict[tuple, list] = {}
+_target_acc: dict[tuple, list] = {}     # (wallet_id, mode, token) -> [их $, время последнего исполнения]
 _locks: dict[tuple, asyncio.Lock] = {}
 skip_counts: dict[tuple, Counter] = {}
 _last_fail_notify: dict[tuple, float] = {}
@@ -158,6 +163,24 @@ def _fill_meta_into(base: dict, meta) -> None:
     base["outcome"] = base.get("outcome") or meta.outcome
 
 
+def _their_amount(w, mode: str, tt: TargetTrade) -> float | None:
+    """Сколько они вложили «этим решением». Исполнения меньше порога
+    копятся по токену; как только сумма серии (с паузами не дольше
+    TARGET_ACC_GAP) дошла до порога — копируем всю серию разом. None —
+    порог пока не набран."""
+    key = (w.id, mode, tt.token_id)
+    now = time.time()
+    acc = _target_acc.get(key)
+    if acc and now - acc[1] > TARGET_ACC_GAP:
+        acc = None
+    total = (acc[0] if acc else 0.0) + tt.usdc
+    if total < w.min_target_usdc:
+        _target_acc[key] = [total, now]
+        return None
+    _target_acc.pop(key, None)
+    return total
+
+
 async def _copy_buy(w, tt: TargetTrade, meta_task) -> None:
     mode = w.mode
     base = _base_row(w, tt, "BUY", "copy")
@@ -174,9 +197,14 @@ async def _copy_buy(w, tt: TargetTrade, meta_task) -> None:
         return _skip(w, mode, tt, f"сигнал устарел ({fmt_age(age)})", base)
     if not (w.min_price <= price <= w.max_price):
         return _skip(w, mode, tt, f"их цена {price:.3f} вне диапазона {w.min_price:g}–{w.max_price:g}", base)
-    if tt.usdc < w.min_target_usdc:
-        return _skip(w, mode, tt, f"их сделка {money(tt.usdc)} меньше порога {money(w.min_target_usdc)}",
-                     base, notify_text=False)
+    their_usdc = _their_amount(w, mode, tt)
+    if their_usdc is None:
+        acc = _target_acc.get((w.id, mode, tt.token_id)) or [0.0]
+        return _skip(w, mode, tt, f"их сделка меньше порога — копится (эта {money(tt.usdc)}, "
+                                  f"всего {money(acc[0])} из {money(w.min_target_usdc)})",
+                     base, notify_text=False, status="accumulating")
+    if their_usdc != tt.usdc:
+        base["target_usdc"] = round(their_usdc, 4)
     if tt.role == "maker" and not w.copy_maker_fills:
         return _skip(w, mode, tt, "исполнилась их лимитка (мейкер) — такие не копирую", base, notify_text=False)
     existing = positions.get_open(w.id, mode, tt.token_id)
@@ -210,7 +238,7 @@ async def _copy_buy(w, tt: TargetTrade, meta_task) -> None:
     if w.size_mode == "fixed":
         size = w.size_fixed
     else:
-        size = tt.usdc * w.size_pct / 100.0
+        size = their_usdc * w.size_pct / 100.0
     size = min(size, w.max_usdc)
     room = w.max_position_usdc - (existing.cost if existing else 0.0)
     if room < MIN_ORDER_USDC:
