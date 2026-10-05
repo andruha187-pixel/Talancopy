@@ -447,12 +447,22 @@ def health_text() -> str:
     lines = ["🩺 <b>Источники сделок</b>"]
     now = now_ms()
     for lst in chain.listeners:
-        st = "✅ подключён" if lst.connected else "❌ нет связи"
-        head = f", блоки приходят через {lst.head_lag_ms / 1000:.1f}с" if lst.head_lag_ms is not None else ""
+        if lst.connected:
+            st = "✅ подключён"
+        elif lst.error or lst.reconnects:
+            st = "❌ нет связи"
+        else:
+            st = "⏳ подключаюсь"
+        head = ""
+        if lst.head_lag_ms is not None:
+            fresh = now - lst.last_head_ms < 30000
+            head = (f", новые блоки приходят через {lst.head_lag_ms / 1000:.1f}с" if fresh
+                    else f", блоков нет уже {fmt_age((now - lst.last_head_ms) / 1000)}")
+        watch = f"слежу за {lst.subscribed_wallets}" if lst.subscribed_wallets else "кошельков пока нет"
         last = f", последнее {fmt_age((now - lst.last_event_ms) / 1000)} назад" if lst.last_event_ms else ""
         err = f"\n   ошибка: {esc(lst.error)}" if lst.error else ""
-        lines.append(f"⛓ Блокчейн {esc(lst.name())}: {st}, слежу за {lst.subscribed_wallets}{head}; "
-                     f"событий {lst.events}{last}{err}")
+        lines.append(f"⛓ Блокчейн {esc(lst.name())}: {st}, {watch}{head}; "
+                     f"сделок поймано {lst.events}{last}{err}")
     if not chain.listeners:
         lines.append("⛓ Блокчейн: выключен (CHAIN_ENABLED)")
     if settings.RTDS_ENABLED:
@@ -463,15 +473,21 @@ def health_text() -> str:
                      + (f"\n   ошибка: {esc(s['error'])}" if s["error"] else ""))
     if settings.POLL_ENABLED:
         s = poller.stats
-        lines.append(f"🔁 Опрос Data API: опросов {s['polls']}, ошибок {s['errors']}"
-                     + (f"\n   последняя ошибка: {esc(s['last_error'])}" if s["last_error"] else ""))
+        if not state.active_addresses() and not s["polls"]:
+            lines.append("🔁 Опрос Data API: ждёт кошельков (опрашивает только копируемых)")
+        else:
+            lines.append(f"🔁 Опрос Data API: опросов {s['polls']}, ошибок {s['errors']}"
+                         + (f"\n   последняя ошибка: {esc(s['last_error'])}" if s["last_error"] else ""))
     bs = book_stream.stats
     lines.append(f"📗 Стакан WS: {'✅' if bs['connected'] else '❌'} подписок {len(book_stream._subscribed)}, "
                  f"сообщений {bs['messages']}")
     lines.append("")
     lines.append("<b>Кто первым замечает сделки</b> (за этот запуск):")
     names = {"chain": "блокчейн", "rtds": "RTDS ордера", "rtds_fills": "RTDS исполнения", "poll": "опрос API"}
-    for src, d in detector.latency_summary().items():
+    summary = detector.latency_summary()
+    if not any(d["seen"] for d in summary.values()):
+        lines.append("  пока не было сделок копируемых кошельков")
+    for src, d in summary.items():
         if not d["seen"]:
             continue
         med = f", задержка от блока ~{d['median_ms'] / 1000:.1f}с" if d["median_ms"] is not None else ""
