@@ -42,7 +42,7 @@ WALLET_COLUMNS = [
     "rank", "wallet", "name", "sources", "score", "verdict", "reasons",
     "all_time_pnl", "economic_pnl", "pnl_7d", "pnl_30d", "pnl_90d", "pnl_as_of", "pnl_lag_days",
     "volume_lifetime", "roi_on_volume", "biggest_win", "biggest_win_share",
-    "n_resolved", "window_days", "roi_resolved", "win_rate", "avg_entry",
+    "n_resolved", "window_days", "window_capped", "roi_resolved", "win_rate", "avg_entry",
     "edge_cents", "z_bets", "z_usd", "profit_factor", "top1_share", "top3_share", "pnl_ex_top3", "median_bet",
     "fav_share", "longshot_share", "fast_share_pos", "fast_share_trades", "n_resolved_30d", "roi_resolved_30d",
     "edge_by_price", "categories", "main_category", "max_dd", "max_dd_90d", "daily_sharpe", "best_day_share",
@@ -52,6 +52,7 @@ WALLET_COLUMNS = [
     "median_order_usdc", "p90_order_usdc", "buy_share", "avg_buy_price", "fav_buy_share", "last_trade_age_h",
     "markets_in_sample", "top_event_share", "mid_price_share", "both_sides_share", "median_hold_h",
     "short_hold_share", "hold_source", "sell_before_end_share", "taker_share",
+    "sports_buy_share", "live_share", "live_swing_share", "live_late_share",
     "drift_samples", "drift_3s_cents", "drift_60s_cents", "account_age_days", "trades_lifetime",
     "trade_count_lifetime", "open_positions", "open_value", "open_cost", "open_upnl", "profile_url",
 ]
@@ -80,7 +81,8 @@ wallets.csv — по строке на разобранный кошелёк, о
   edge_cents  — средний «перевес» ставки: (итог за акцию − цена входа), в центах. >0 = лучше рынка.
   z_bets      — значимость edge по ставкам (≥2 — навык вероятнее удачи); z_usd — то же в долларах.
   roi_resolved — PnL / вложено по закрытым + разрешённым позициям (включая непогашенные проигрыши)
-               за window_days — окно, в котором выборка позиций полная.
+               за window_days — сколько дней покрывают разобранные ставки (от самого раннего входа);
+               если позиций слишком много, берётся окно, в котором выборка полная (window_capped).
   top1_share  — доля лучшей ставки во всей прибыли; pnl_ex_top3 — PnL без 3 лучших ставок.
   fav_share / longshot_share — доля денег во входах ≥0.90 / ≤0.10.
   fast_share_* — доля в быстрых крипто-рынках (5м/15м/час) — их не скопировать.
@@ -89,6 +91,8 @@ wallets.csv — по строке на разобранный кошелёк, о
   median_hold_h — медианное удержание позиции, часы (hold_source: по позициям или по сделкам).
   taker_share — доля объёма, купленного/проданного по рынку (остальное — их лимитки).
   both_sides_share — доля рынков, где покупал обе стороны (маркет-мейкинг/арбитраж).
+  live_share — признак ставок по ходу матча: доля спортивных покупок «на качелях» (цена исхода
+    гуляла ≥10¢ за ≤3 ч) или купленных меньше чем за 2 ч до погашения выигрыша. >40% — лайв-игрок.
   mm_income_share — доля дохода не от сделок (ребейты, награды, возвраты комиссий).
   drift_3s/60s_cents — как уходит цена через 3/60 с после их покупки (сколько потеряет копирующий).
   pos_weeks_share — доля прибыльных недель за 90 дней; max_dd_90d — макс. просадка за 90 дней, $.

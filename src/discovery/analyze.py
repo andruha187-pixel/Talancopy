@@ -55,6 +55,8 @@ CATEGORY_RULES = [
                                r"missile|sanction|putin|zelensk|netanyahu|hamas|hezbollah|invade")),
     ("economics", re.compile(r"fed-|fomc|rate-cut|interest-rate|inflation|cpi|gdp|recession|unemployment|jobs-report|"
                              r"payroll|tariff|treasury|powell")),
+    ("tech", re.compile(r"gpt|openai|anthropic|claude|gemini|grok|deepseek|mythos|llm|chatgpt|sora|kling|"
+                        r"text-to-video|best-ai|ai-model|agi-|xai-|mistral|astra-model|astra-released")),
     ("finance", re.compile(r"stock|nasdaq|s-p-500|sp500|dow-|tesla|nvidia|apple|google|amazon|microsoft|meta-|"
                            r"ipo|earnings|market-cap|gold|oil|silver|wti")),
     ("culture", re.compile(r"oscar|grammy|emmy|movie|box-office|album|song|spotify|taylor-swift|celebrity|tiktok|"
@@ -74,7 +76,19 @@ PNL_STALE_DAYS = 3.0
 _INCOME_FIELDS = ("maker_rebate", "taker_rebate", "reward_income", "yield_income", "referral_income")
 
 
+# Спортивные и киберспортивные рынки Polymarket начинаются с кода лиги:
+# nfl-…, lol-…, val-…, dota2-…, epl-…, lal-…, itf-…, cwbb-… и т.п.
+SPORTS_PREFIX_RE = re.compile(
+    r"^(nfl|nba|mlb|nhl|wnba|cfb|cbb|cwbb|ncaab?|epl|lal|bun|sea|fl1|ere|por|elc|ucl|uel|uecl|mls|bra|arg|"
+    r"col|mex|tur|swe|nor|den|sco|bel|aut|sui|grc|jpn|kor|chn|aus|rus|ukr|pol|cze|atp|wta|itf|ufc|box|pga|"
+    r"f1|nascar|ipl|cric|cs2|csgo|lol|val|dota2|codmw|cod|lec|lck|lpl|r6|ow|rl|fif|fifwc|kbo|npb|bk[a-z]*|"
+    r"euroleague|ncaaf|afl|nrl|rugby|tennis|golf|darts|snooker|mma|pfl|bellator)\d*-")
+
+
 def categorize(slug: str | None, event_slug: str | None = None) -> str:
+    for part in (slug, event_slug):
+        if part and SPORTS_PREFIX_RE.match(str(part).lower()):
+            return "sports"
     text = f"{slug or ''} {event_slug or ''}".lower()
     for name, rx in CATEGORY_RULES:
         if rx.search(text):
@@ -227,12 +241,22 @@ def entry_ts(p: dict) -> float:
     return _ts(p.get("first_entry_at")) or _ts(p.get("last_event_at") or p.get("timestamp"))
 
 
+def end_ts(v) -> float | None:
+    """Конец рынка. end_date в позициях — дата без времени ('2026-10-05'):
+    берём конец этих суток, иначе матч, который начался днём, «закончится»
+    в полночь до своего начала и удержание выйдет отрицательным."""
+    t = _date_ts(v)
+    if t and isinstance(v, str) and len(v.strip()) == 10:
+        t += 86400
+    return t
+
+
 def settle_ts(p: dict) -> float:
     """Когда позиция стала окончательной: продажа (last_event_at) или конец
     рынка (end_date) — что раньше. Погашение выигрыша бывает через недели
     после конца рынка, поэтому одно last_event_at завышает «свежесть»."""
     last = _ts(p.get("last_event_at") or p.get("timestamp"))
-    end = _date_ts(p.get("end_date"))
+    end = end_ts(p.get("end_date"))
     cands = [t for t in (last, end) if t]
     return min(cands) if cands else 0.0
 
@@ -281,12 +305,15 @@ def edge_metrics(resolved: list[dict], now: float | None = None, window_start: f
             continue
         pnl = position_pnl(p)
         y = min(1.0, max(0.0, price * (1.0 + pnl / cost)))
-        bets.append({"cost": cost, "p": price, "pnl": pnl, "y": y, "ts": settle_ts(p),
+        bets.append({"cost": cost, "p": price, "pnl": pnl, "y": y, "ts": settle_ts(p), "t0": entry_ts(p),
                      "slug": p.get("slug"), "event_slug": p.get("event_slug")})
     n = len(bets)
     m: dict = {"n_resolved": n}
     if n == 0:
         return m
+    starts = [b["t0"] for b in bets if b["t0"]]
+    # Сколько дней покрывают разобранные ставки (от самого раннего входа).
+    m["window_days"] = (now - min(starts)) / 86400 if starts else None
     cost_total = sum(b["cost"] for b in bets)
     pnl_total = sum(b["pnl"] for b in bets)
     wins = [b for b in bets if b["pnl"] > 0]
@@ -338,6 +365,56 @@ def edge_metrics(resolved: list[dict], now: float | None = None, window_start: f
         f"{k}:{v[0] / cost_total * 100:.0f}% roi{(v[1] / v[0] * 100 if v[0] else 0):+.0f}% n{v[2]}"
         for k, v in sorted(cats.items(), key=lambda kv: -kv[1][0]))
     m["main_category"] = max(cats.items(), key=lambda kv: kv[1][0])[0] if cats else None
+    return m
+
+
+LIVE_SWING_CENTS = 0.10     # покупки одного исхода с разбросом цены ≥10¢ ...
+LIVE_SWING_SEC = 3 * 3600   # ... за ≤3 часа — так двигается цена только по ходу матча
+LIVE_LEAD_SEC = 2 * 3600    # купил выигравший исход меньше чем за 2 ч до погашения
+
+
+def live_metrics(trades: list[dict], closed: list[dict]) -> dict:
+    """Похоже ли, что человек ставит по ходу матча (лайв). Время начала
+    матча в Data API нет, поэтому два косвенных признака по спортивным
+    покупкам:
+      * «качели» — один исход покупался по ценам с разбросом ≥10¢ в пределах
+        3 часов: до матча линия так не ходит, а по ходу игры — постоянно;
+      * «поздний вход» — выигравший исход куплен меньше чем за 2 часа до
+        погашения (матч + резолюция дольше, значит вход уже в игре).
+    Такие сделки копией не догнать: пока мы видим их ордер, цена уже другая,
+    а фильтр «лайв» в копировщике их пропустит."""
+    buys = []
+    for t in trades or []:
+        if str(t.get("side") or "").upper() != "BUY":
+            continue
+        if categorize(t.get("slug"), t.get("event_slug")) != "sports":
+            continue
+        usd = fnum(t.get("usdc_size")) or fnum(t.get("size")) * fnum(t.get("price"))
+        buys.append((str(t.get("token_id") or t.get("asset") or ""), _ts(t.get("timestamp")), fnum(t.get("price")), usd))
+    all_usd = sum(fnum(t.get("usdc_size")) or fnum(t.get("size")) * fnum(t.get("price"))
+                  for t in trades or [] if str(t.get("side") or "").upper() == "BUY")
+    sport_usd = sum(b[3] for b in buys)
+    m: dict = {"sports_buy_share": sport_usd / all_usd if all_usd > 0 else None}
+    if sport_usd <= 0:
+        return m
+    by_tok: dict[str, list] = defaultdict(list)
+    for b in buys:
+        by_tok[b[0]].append(b)
+    swing_tokens = set()
+    for tok, bb in by_tok.items():
+        prices = [b[2] for b in bb if b[2] > 0]
+        tss = [b[1] for b in bb if b[1]]
+        if prices and tss and max(prices) - min(prices) >= LIVE_SWING_CENTS and max(tss) - min(tss) <= LIVE_SWING_SEC:
+            swing_tokens.add(tok)
+    swing_usd = sum(b[3] for b in buys if b[0] in swing_tokens)
+    redeem_at = {str(p.get("token_id") or ""): _ts(p.get("last_event_at")) for p in closed or []
+                 if fnum(p.get("current_price")) >= 0.99 and fnum(p.get("total_pnl")) > 0}
+    win_buys = [b for b in buys if redeem_at.get(b[0])]
+    win_usd = sum(b[3] for b in win_buys)
+    late_usd = sum(b[3] for b in win_buys if 0 < redeem_at[b[0]] - b[1] < LIVE_LEAD_SEC)
+    m["live_swing_share"] = swing_usd / sport_usd
+    m["live_late_share"] = late_usd / win_usd if win_usd > 0 else None
+    m["live_share"] = max(m["live_swing_share"], m["live_late_share"] or 0.0)
     return m
 
 
@@ -677,6 +754,12 @@ def score_wallet(m: dict) -> tuple[float, str, list[str]]:
                        "копия по рынку будет на спред хуже их цены")
     if d3 is not None and d3 > 2:
         reasons.append(f"после их входа цена за 3 с уходит на {d3:.1f}¢ — копия будет хуже")
+    live = m.get("live_share")
+    is_live = bool(live is not None and live > 0.4 and (m.get("sports_buy_share") or 0) >= 0.3)
+    if is_live:
+        score -= 10
+        reasons.append(f"похоже, ставит по ходу матча (~{live * 100:.0f}% спортивных денег): копия опоздает, "
+                       "а фильтр «лайв» такие сделки пропустит")
     if z >= 2 and zu >= 1.5:
         reasons.append(f"edge значим: {m.get('edge_cents', 0):+.1f}¢ на ставку, z={z:.1f}")
     elif n >= 20:
@@ -687,10 +770,26 @@ def score_wallet(m: dict) -> tuple[float, str, list[str]]:
     if lag is not None and lag > PNL_STALE_DAYS:
         reasons.append(f"PnL у Polymarket обновлён {lag:.0f} дн. назад — окна 7/30/90 дн. на эту дату")
     score = max(0.0, min(100.0, score))
+    # «✅» только с достаточной историей и не для лайв-игроков: короткая
+    # выборка или ставки по ходу матча — максимум «наблюдать».
+    caps_green = []
+    if n < 60:
+        caps_green.append(f"для ✅ мало ставок ({n} < 60)")
+    acc_days = m.get("account_age_days")
+    span = m.get("window_days")
+    if (acc_days is not None and acc_days < 60) or (span is not None and span < 30):
+        caps_green.append(f"короткая история ({min(x for x in (acc_days, span) if x is not None):.0f} дн.)")
+    if is_live:
+        caps_green.append("лайв-ставки")
+    edge_c = m.get("edge_cents")
+    if (d3 is not None and (m.get("drift_samples") or 0) >= 3 and edge_c and edge_c > 0 and d3 >= 0.5 * edge_c):
+        caps_green.append(f"цена за 3 с уходит на {d3:.1f}¢ — это больше половины их перевеса")
+    if caps_green and not hard and score >= 65 and z >= 2 and zu >= 1.5:
+        reasons.append("до ✅ не хватает: " + ", ".join(caps_green))
     if hard:
         verdict = "❌ не копировать"
         reasons = hard + reasons
-    elif score >= 65 and z >= 2 and zu >= 1.5:
+    elif score >= 65 and z >= 2 and zu >= 1.5 and not caps_green:
         verdict = "✅ кандидат"
     elif score >= 45:
         verdict = "🟡 наблюдать (виртуально)"
@@ -709,11 +808,12 @@ def analyze_wallet(raw: dict, now: float | None = None) -> dict:
     resolved = resolved_positions(closed, redeem)
     m: dict = {}
     m.update(edge_metrics(resolved, now, window))
-    m["window_days"] = (now - window) / 86400 if window else None
+    m["window_capped"] = window is not None
     m.update(pnl_series_metrics(raw.get("pnl_points") or [], now))
     m.update(trade_metrics(raw.get("trades") or [], raw.get("taker_trades"), resolved, now,
                            taker_cap=caps.get("taker")))
     m.update(hold_metrics(closed))
+    m.update(live_metrics(raw.get("trades") or [], closed))
     m.update(drift_metrics(raw.get("drift") or []))
     ss = stats_summary(raw.get("stats"))
     m["all_time_pnl"] = ss["trading_pnl"] if ss["trading_pnl"] is not None else m.get("pnl_total")
