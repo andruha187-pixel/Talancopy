@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: polymarket-5m-bot
+    env: python
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m src.main"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Остальные переменные (POLY_PRIVATE_KEY, TELEGRAM_BOT_TOKEN и т.д.)
+      # задаются вручную в Render Dashboard -> Environment, не в этом файле —
+      # секреты в render.yaml коммитить нельзя.

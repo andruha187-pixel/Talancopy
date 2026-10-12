@@ -1,5 +1,11 @@
-data/*
-!data/.gitkeep
-**/__pycache__
-*.pyc
 .env
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/*.db
+logs/*.log
+.DS_Store
+README.md

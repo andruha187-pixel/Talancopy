@@ -2,8 +2,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# build-essential — на случай, если для какой-то зависимости (eth-*/coincurve)
-# нет готового колеса под платформу сервера.
+# Системные зависимости для сборки некоторых eth-* пакетов (py-clob-client
+# тянет за собой криптографию с C-расширениями).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-ENV PYTHONUNBUFFERED=1
-# Фоновый воркер, HTTP-порта нет — в Coolify отключи healthcheck по порту.
+# Никакого HTTP-сервера у бота нет — это фоновый воркер. Если платформа
+# (Coolify/Render/etc.) настаивает на healthcheck по порту, отключи
+# healthcheck в настройках приложения, а не открывай тут порт искусственно.
 CMD ["python", "-m", "src.main"]
