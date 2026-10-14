@@ -30,10 +30,13 @@ def _get_int(name: str, default: int) -> int:
 @dataclass
 class Settings:
     # --- Активы ---
-    # Список торгуемых монет через запятую — на каждую заводится независимый
-    # поток по каждому таймфрейму (см. src/timeframes.py).
+    # Список монет через запятую — на каждую заводится независимый поток по
+    # каждому таймфрейму (см. src/timeframes.py). HYPE убран: в стакане по цене
+    # 0.90–0.94 у него обычно ~$100 (у BTC ~$3650, ETH ~$1220, SOL ~$900), в
+    # половине случаев меньше. BNB и DOGE есть, но по умолчанию выключены
+    # (см. ENABLED_ASSETS) — включаются кнопкой в 🪙 Активах.
     ASSETS: list = field(default_factory=lambda: [
-        a.strip().lower() for a in os.getenv("ASSETS", "btc,eth,sol,xrp,bnb,doge,hype").split(",") if a.strip()
+        a.strip().lower() for a in os.getenv("ASSETS", "btc,eth,sol,xrp,bnb,doge").split(",") if a.strip()
     ])
 
     # --- Binance (источник цены/индикаторов) ---
@@ -125,35 +128,38 @@ class Settings:
     # чтобы не разгонять риск компаундингом на непроверенной вживую
     # стратегии. Меняй TRADE_SIZE_USDC пропорционально своему реальному
     # депозиту — это НЕ универсальная константа.
-    TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 20.0)
-    # Наши настройки по умолчанию (11–12.10): ставка — % от банка, 8% (у XRP 5%,
-    # тонкий стакан — см. ASSET_OVERRIDES). Банк = STARTING_BANKROLL_USDC +
+    # Бот двух стратегий начинает с фиксированной ставки $1: стратегии новые,
+    # сначала проверяются малыми деньгами. Ставка общая для виртуальных сделок
+    # и обеих стратегий; меняется в 💰 Размер позиции (и своя у монеты в ⚙️).
+    TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 1.0)
+    # Режим % от банка остаётся доступен: банк = STARTING_BANKROLL_USDC +
     # реальный результат с начала базы; поставь свой реальный баланс.
-    SIZING_MODE: str = os.getenv("SIZING_MODE", "percent").strip().lower()
+    SIZING_MODE: str = os.getenv("SIZING_MODE", "fixed").strip().lower()
     BANKROLL_PCT: float = _get_float("BANKROLL_PCT", 8.0)
     STARTING_BANKROLL_USDC: float = _get_float("STARTING_BANKROLL_USDC", 300.0)
-    # Какие монеты включены и какие торгуют реальными деньгами. По умолчанию
-    # реальных нет — все в DRY: 122 реальные сделки 09–12.10 перевеса не
-    # показали, версия с ценой Chainlink сначала проверяется виртуально.
-    # Реальные включаются в Telegram (🪙 Активы) или LIVE_ASSETS=btc,eth,xrp.
-    ENABLED_ASSETS: str = os.getenv("ENABLED_ASSETS", "btc,eth,xrp,sol,bnb,doge")
+    # Какие монеты включены и по каким монетам стратегиям можно входить
+    # реальными деньгами (🔴 LIVE в 🪙 Активах). По умолчанию включены BTC, ETH,
+    # SOL, XRP: на истории 18.09–12.10 BNB и DOGE были хуже всех (k 1.32 и 1.24,
+    # и в спокойные часы тоже в минусе), а с ними стратегия 2 давала меньше.
+    ENABLED_ASSETS: str = os.getenv("ENABLED_ASSETS", "btc,eth,sol,xrp")
     LIVE_ASSETS: str = os.getenv("LIVE_ASSETS", "")
     # Свои диапазоны и ставки монет (JSON). На альтах вход по 0.95 не окупался
     # (архив 25.09–11.10: 51 вход по 0.95 — 5 проигрышей при 2.6 ожидаемых),
     # поэтому у всех, кроме BTC, максимум 0.94.
     ASSET_OVERRIDES: str = os.getenv("ASSET_OVERRIDES", json.dumps({
         "eth": {"min_entry_price": 0.90, "max_entry_price": 0.94},
-        "xrp": {"min_entry_price": 0.90, "max_entry_price": 0.94,
-                "sizing_mode": "percent", "bankroll_pct": 5.0, "trade_size_usdc": 20.0},
+        "xrp": {"min_entry_price": 0.90, "max_entry_price": 0.94},
         "sol": {"min_entry_price": 0.90, "max_entry_price": 0.94},
         "bnb": {"min_entry_price": 0.90, "max_entry_price": 0.94},
         "doge": {"min_entry_price": 0.90, "max_entry_price": 0.94},
-        "hype": {"min_entry_price": 0.90, "max_entry_price": 0.94},
     }))
     # Общий потолок ОДНОВРЕМЕННО открытых позиций по ВСЕМ активам/таймфреймам
     # разом — без этого при 12 параллельных потоках (6 монет x 2 таймфрейма)
     # можно случайно открыть 12 позиций разом, если все совпадут по времени.
-    MAX_OPEN_POSITIONS: int = _get_int("MAX_OPEN_POSITIONS", 2)
+    # В боте двух стратегий по одному рынку может быть две реальные позиции
+    # (по одной на стратегию), а монеты часто входят в одно окно вместе —
+    # поэтому по умолчанию 8 (4 монеты × 2 стратегии).
+    MAX_OPEN_POSITIONS: int = _get_int("MAX_OPEN_POSITIONS", 8)
     # Ниже этой суммы даже пробовать не стоит — комиссии и слиппедж съедят
     # выгоду. Если в стакане меньше этого объёма по нужной цене — тик тихо
     # пропускается (не считается ошибкой, просто рынок сейчас неликвиден).
@@ -176,6 +182,31 @@ class Settings:
 
     # --- Режим работы ---
     DRY_RUN: bool = _get_bool("DRY_RUN", True)          # True = только сигналы, ордера не шлём
+
+    # --- Две стратегии (src/duo.py) ---
+    # Каждый сигнал бот записывает как виртуальную сделку, а реальные входы
+    # делают две стратегии по результатам виртуальных. false — бот работает
+    # по-старому: сигнал = сделка (реальная по монетам с 🔴 LIVE).
+    STRATEGIES_MODE: bool = _get_bool("STRATEGIES_MODE", True)
+    # Фильтр расстояния цены от страйка (1.5 ATR и минимум в %). Выключен —
+    # логика «сломанного» бота 12–14.10: фаворит по цене из диапазона входа,
+    # тренд, время и волатильность как обычно, расстояние не проверяется.
+    DISTANCE_FILTER_ENABLED: bool = _get_bool("DISTANCE_FILTER_ENABLED", False)
+    # 1️⃣ «После проигрыша»: после виртуального проигрыша монеты — N входов по
+    # ней (N своё у монеты: STRAT_A_COUNTS='{"sol": 8, "btc": 2}', остальным
+    # STRAT_A_DEFAULT_N). Проигрыш внутри серии начинает её заново.
+    STRAT_A_ENABLED: bool = _get_bool("STRAT_A_ENABLED", True)
+    STRAT_A_LIVE: bool = _get_bool("STRAT_A_LIVE", False)
+    STRAT_A_DEFAULT_N: int = _get_int("STRAT_A_DEFAULT_N", 2)
+    STRAT_A_COUNTS: str = os.getenv("STRAT_A_COUNTS", "")
+    # 2️⃣ «Пауза после проигрыша»: вход по монете, только если за последние
+    # STRAT_B_PAUSE_MIN минут у неё не было виртуальных проигрышей.
+    # STRAT_B_SCOPE: coin — у каждой монеты своя пауза (по умолчанию), all —
+    # проигрыш любой монеты останавливает все.
+    STRAT_B_ENABLED: bool = _get_bool("STRAT_B_ENABLED", True)
+    STRAT_B_LIVE: bool = _get_bool("STRAT_B_LIVE", False)
+    STRAT_B_PAUSE_MIN: int = _get_int("STRAT_B_PAUSE_MIN", 60)
+    STRAT_B_SCOPE: str = os.getenv("STRAT_B_SCOPE", "coin").strip().lower()
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
