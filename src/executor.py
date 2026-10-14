@@ -12,7 +12,7 @@ import time
 
 from config import settings
 from src import storage, polymarket_client, telegram_notify, book_stream, runtime_state, loss_stats, diagnostics
-from src import entry_confirm
+from src import entry_confirm, duo
 from src.market_discovery import ActiveMarket, get_resolution
 from src.strategy import Decision
 
@@ -32,7 +32,11 @@ def _quiet(asset: str, dry_run: bool) -> bool:
     """Не слать в Telegram виртуальные сделки монет, переведённых в DRY
     (иначе 5–6 монет засыплют чат). Монеты, помеченные как LIVE, уведомляют
     как раньше, даже если весь бот сейчас в DRY RUN. Включается кнопкой
-    «🔔 Уведомления DRY-монет» в 🪙 Активах."""
+    «🔔 Уведомления DRY-монет» в 🪙 Активах.
+    Бот двух стратегий: молчат все виртуальные и тестовые сделки (их
+    десятки в час), пишут только реальные."""
+    if duo.enabled():
+        return bool(dry_run) and not runtime_state.get("notify_dry_assets")
     return (bool(dry_run) and not runtime_state.is_asset_live(asset)
             and not runtime_state.get("notify_dry_assets"))
 
@@ -213,8 +217,72 @@ async def maybe_enter(market: ActiveMarket, decision: Decision, path: str = "slo
         await _enter_locked(market, decision, path)
 
 
+async def _daily_limit_hit(market: ActiveMarket) -> bool:
+    """Дневной стоп-лосс по реальным сделкам достигнут — сообщить (раз в день)
+    и отложить повтор входа."""
+    global _daily_limit_notified_day
+    if not _daily_loss_exceeded():
+        return False
+    day = int(time.time() // 86400)
+    if _daily_limit_notified_day != day:
+        _daily_limit_notified_day = day
+        await telegram_notify.notify(
+            f"🛑 Стоп-лосс достигнут (лимит {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC/день) — "
+            f"реальные входы заблокированы до конца дня (виртуальные продолжаются). "
+            f"Поменять лимит можно в 🛑 Стоп-лосс в меню."
+        )
+    diagnostics.record_skip(market.slug, market.asset, "daily")
+    _cool_down(market.slug)
+    return True
+
+
+async def _enter_duo(market: ActiveMarket, decision: Decision, path: str) -> None:
+    """Бот двух стратегий (src/duo.py): по сигналу — виртуальная сделка, потом
+    входы стратегий 1️⃣ и 2️⃣, если они сейчас хотят в этот рынок."""
+    slug, asset = market.slug, market.asset
+    # 1) Виртуальная сделка — по каждому сигналу, в том числе на паузе ⏸: по
+    # ним стратегии «читают» рынок.
+    if not duo.has_virtual(slug):
+        row = storage.get_open_trade_for_market(slug, strategy=duo.VIRT)
+        if row is not None:
+            duo.on_virtual_logged(row[0], slug, row[2])
+        else:
+            tid = await _enter_sized(market, decision, path, True, strategy=duo.VIRT)
+            if tid is None:
+                return  # не записалась (мало ликвидности) — повторим на следующем сигнале
+            duo.on_virtual_logged(tid, slug, decision.direction)
+    want = duo.wanted(asset, slug)
+    if not want:
+        return
+    if runtime_state.get("paused"):
+        diagnostics.record_skip(slug, asset, "paused")
+        return
+    # 2) Стратегии — по очереди; у каждой своя сделка в рынке
+    for strat in want:
+        dry_run = duo.is_dry(strat, asset)
+        key = f"{slug}#{strat}"
+        if not dry_run:
+            if await _daily_limit_hit(market):
+                continue   # реальный вход нельзя, тестовый другой стратегии — можно
+            open_live = storage.count_open_trades(live_only=True, running_only=True)
+            if open_live + len(_inflight_live - {key}) >= runtime_state.get("max_open_positions"):
+                diagnostics.record_skip(slug, asset, "cap")
+                _cool_down(slug)
+                continue
+            _inflight_live.add(key)
+        try:
+            tid = await _enter_sized(market, decision, path, dry_run, strategy=strat)
+        finally:
+            _inflight_live.discard(key)
+        if tid is not None:
+            duo.on_strategy_entered(strat, slug)
+
+
 async def _enter_locked(market: ActiveMarket, decision: Decision, path: str) -> None:
     global _daily_limit_notified_day
+    if duo.enabled():
+        await _enter_duo(market, decision, path)
+        return
     if runtime_state.get("paused"):
         diagnostics.record_skip(market.slug, market.asset, "paused")
         return
@@ -254,14 +322,20 @@ async def _enter_locked(market: ActiveMarket, decision: Decision, path: str) -> 
         _inflight_live.discard(market.slug)
 
 
-async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_run: bool) -> None:
+_STRAT_TAG = {"virt": "👻 ", "A": "1️⃣ ", "B": "2️⃣ "}
+
+
+async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_run: bool,
+                       strategy: str | None = None) -> int | None:
+    """Вход с размером ставки. Возвращает id записанной сделки или None, если
+    сделки нет. strategy — метка сделки в боте двух стратегий (src/duo.py)."""
     # Ставка и диапазон — свои у монеты (⚙️ в 🪙 Активах), иначе общие
     base_size = runtime_state.compute_trade_size(market.asset)
     range_min, range_max = runtime_state.entry_range(market.asset)
     if base_size <= 0:
         diagnostics.record_skip(market.slug, market.asset, "no_bank")
         _cool_down(market.slug)
-        return  # банк в режиме % исчерпан — ставить нечего
+        return None  # банк в режиме % исчерпан — ставить нечего
     score_threshold = runtime_state.get("safety_score_threshold")
     if runtime_state.get("size_scaling_enabled"):
         trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
@@ -315,7 +389,7 @@ async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_
                 f"⚠️ Сигнал по {market.slug} пропущен: в стакане по цене до {execution_price:.2f} всего "
                 f"{available_liquidity:.2f} USDC (источник: {book.source})."
             )
-        return
+        return None
     if available_liquidity < trade_size:
         trade_size = round(available_liquidity * 0.9, 2)
 
@@ -332,17 +406,17 @@ async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_
                 "❌ LIVE включён, но POLY_PRIVATE_KEY не задан — вход пропущен. "
                 "Проверь переменные окружения и передеплой."
             )
-            return
+            return None
         result = await _execute_live_buy(market, token_id, trade_size, execution_price, tick, range_max)
         if result is None:
             _cool_down(market.slug)
-            return
+            return None
         filled_usdc, filled_shares, order_id, status, attempts, execution_price = result
         trade_size = round(filled_usdc, 2)
         # Реальная средняя цена исполнения (раньше в базу шёл потолок ордера)
         entry_logged = round(filled_usdc / filled_shares, 4) if filled_shares > 0 else execution_price
 
-    storage.log_trade(
+    trade_id = storage.log_trade(
         market_slug=market.slug,
         condition_id=market.condition_id,
         direction=decision.direction,
@@ -357,10 +431,12 @@ async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_
         range_min=range_min,
         range_max=range_max,
         entry_path=path,
+        strategy=strategy,
     )
 
+    mode_tag = ("🧪 [тест] " if strategy in ("A", "B") else "🧪 [DRY RUN] ") if dry_run else "✅ "
     await _notify(market.asset, dry_run,
-        f"{'🧪 [DRY RUN] ' if dry_run else '✅ '}Вход {decision.direction} по {market.slug}"
+        f"{_STRAT_TAG.get(strategy, '')}{mode_tag}Вход {decision.direction} по {market.slug}"
         f"{' ⚡ быстрая проверка' if path == 'fast' else ''}\n"
         f"Ask на сигнале: {decision.entry_price:.3f} | Потолок исполнения: {first_cap:.3f} "
         f"(тик {tick:g}) | Размер: {trade_size:.2f} из {base_size:.2f} USDC (score {decision.safety_score}/{score_threshold:.0f})\n"
@@ -368,6 +444,7 @@ async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_
         + f"Диапазон {range_min:.2f}–{range_max:.2f} | Расхождение: {decision.distance_atr} ATR | "
         f"До конца рынка: {decision.minutes_left:.1f} мин"
     )
+    return trade_id
 
 
 async def execute_copytrade(token_id: str, direction: str, slug: str, condition_id: str,
@@ -463,8 +540,14 @@ async def label_resolved_markets(exclude_slugs: set[str] | None = None) -> None:
 
 
 async def settle_resolved_trades() -> None:
-    for trade_id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run, token_id in storage.get_unsettled_trades():
-        outcome = await get_resolution(market_slug)
+    # По одному рынку бывает несколько сделок (бот двух стратегий: виртуальная
+    # + 1️⃣ + 2️⃣) — Gamma API спрашиваем один раз на рынок за проход.
+    resolved: dict[str, str | None] = {}
+    for (trade_id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run, token_id,
+         strategy, early) in storage.get_unsettled_trades(with_strategy=True):
+        if market_slug not in resolved:
+            resolved[market_slug] = await get_resolution(market_slug)
+        outcome = resolved[market_slug]
         if outcome is None:
             continue
 
@@ -473,20 +556,26 @@ async def settle_resolved_trades() -> None:
         pnl = (shares * 1.0 - size_usdc) if won else -size_usdc
         if not storage.settle_trade(trade_id, outcome, pnl):
             continue  # уже закрыта стоп-лоссом, пока ждали ответ Gamma API
+        if strategy == duo.VIRT:
+            try:
+                duo.on_official(market_slug, direction, outcome, early)
+            except Exception:  # noqa: BLE001 — стратегии не должны ломать резолюцию
+                pass
 
         asset, _label = storage.parse_market_slug(market_slug)
         emoji = "🟢" if won else "🔴"
         text = (
-            f"{emoji} Рынок {market_slug} зарезолвился: {outcome}. "
+            f"{_STRAT_TAG.get(strategy, '')}{emoji} Рынок {market_slug} зарезолвился: {outcome}. "
             f"Наша ставка: {direction}. PnL: {pnl:+.2f} USDC"
-            + (" (dry run)" if dry_run else "")
+            + ((" (тест)" if strategy in ("A", "B") else " (dry run)") if dry_run else "")
         )
         if not won:
             # Проигрыш по 0.95 — это «заложенные» ~5%, а не обязательно ошибка:
             # показываем, сколько таких проигрышей ожидалось по ценам входа.
             try:
-                st = storage.get_outcome_stats(live=not dry_run, asset=asset)
-                label = f"{asset.upper()}{' DRY' if dry_run else ''}"
+                st = storage.get_outcome_stats(live=not dry_run, asset=asset, strategy=strategy)
+                label = f"{asset.upper()}{' ' + duo.SHORT[strategy] if strategy in duo.SHORT else ''}"
+                label += (" тест" if strategy in ("A", "B") else " DRY") if dry_run else ""
                 text += "\n" + loss_stats.loss_context(st, entry_price, label)
             except Exception:  # noqa: BLE001 — приписка не должна ломать резолюцию
                 pass
@@ -516,9 +605,12 @@ async def check_position_stop_losses() -> None:
         return
     stop_pct = runtime_state.get("position_stop_loss_pct")
 
-    for trade_id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run, token_id in storage.get_unsettled_trades():
+    for (trade_id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run, token_id,
+         strategy, _early) in storage.get_unsettled_trades(with_strategy=True):
         if not token_id:
             continue  # старые сделки до появления этого поля — пропускаем, не падаем
+        if strategy == duo.VIRT:
+            continue  # виртуальные — «чтение рынка» стратегиями: им нужен исход рынка, а не стоп
 
         book = await polymarket_client.get_orderbook_cached(token_id)
         if book.best_bid is None:

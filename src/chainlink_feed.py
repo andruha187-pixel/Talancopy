@@ -287,6 +287,20 @@ def price_at(asset: str, ts_sec: float, tolerance_sec: float = STRIKE_TOLERANCE_
     return None
 
 
+def price_after(asset: str, ts_sec: float, tolerance_sec: float = STRIKE_TOLERANCE_SEC) -> float | None:
+    """Первая точка не раньше ts_sec (не дальше tolerance). В отличие от
+    price_at не берёт точку ДО ts_sec: цена на конце окна известна только
+    когда пришла точка после его конца (иначе это ещё не цена закрытия)."""
+    a = asset.lower()
+    tss = _hist_ts.get(a)
+    if not tss:
+        return None
+    i = bisect.bisect_left(tss, ts_sec)
+    if i < len(tss) and tss[i] - ts_sec <= tolerance_sec:
+        return _hist_val[a][i]
+    return None
+
+
 def strike_for(slug: str, asset: str, start_ts: float) -> float | None:
     """Страйк рынка по Chainlink: цена на момент начала окна. Найденный
     запоминаем — дальше рынок его не меняет."""

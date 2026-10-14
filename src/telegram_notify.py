@@ -29,7 +29,7 @@ SCORE_PRESETS = [75, 85, 88, 92]
 DISTANCE_PRESETS = [0.0, 0.05, 0.07, 0.10]
 # Окно входа (минут до конца рынка). 1–4.5 — рекомендованное по отчётам 25.09–08.10.
 WINDOW_PRESETS = [(1.0, 3.5), (1.0, 4.0), (1.0, 4.5)]
-MAX_POS_PRESETS = [2, 3, 4, 6]
+MAX_POS_PRESETS = [2, 4, 6, 8]   # бот двух стратегий: по умолчанию 8 (4 монеты × 2 стратегии)
 
 
 def set_state_ref(state: dict) -> None:
@@ -152,7 +152,11 @@ def _settings_text() -> str:
         f"📦 Реальных позиций одновременно: до {runtime_state.get('max_open_positions')}\n"
         "Считаются только позиции в ещё идущих рынках. Монеты двигаются вместе, "
         "поэтому больше позиций — больше проигрышей разом в плохие 5 минут.\n\n"
-        f"📏 Мин. расстояние от страйка: {_distance_summary()}\n"
+        f"📏 Фильтр расстояния: {'вкл' if runtime_state.get('distance_filter_enabled') else 'выкл'}\n"
+        "Выкл — логика «сломанного» бота 12–14.10: вход по фавориту без проверки расстояния от "
+        "страйка (1.5 ATR и минимум в %). Вкл — как в основном боте.\n\n"
+        f"📏 Мин. расстояние от страйка: {_distance_summary()}"
+        + ("" if runtime_state.get("distance_filter_enabled") else " (не действует, пока фильтр выкл)") + "\n"
         "Не входить, если цена ближе к страйку, чем этот % от цены.\n\n"
         f"⚡ Быстрый вход: {'вкл' if runtime_state.get('fast_entry_enabled') else 'выкл'}\n"
         f"Кроме проверки раз в 3 с бот раз в {max(0.1, settings.FAST_LOOP_INTERVAL_SEC):g} с проверяет сигнал "
@@ -233,8 +237,12 @@ def _main_menu_text() -> str:
         f"Диапазон входа: {_range_text()}",
         f"Окно входа: за {runtime_state.entry_window()[0]:g}–{runtime_state.entry_window()[1]:g} мин до конца | "
         f"позиций до {runtime_state.get('max_open_positions')}",
-        f"Мин. расстояние от страйка: {_distance_summary()}",
+        (f"Мин. расстояние от страйка: {_distance_summary()}" if runtime_state.get("distance_filter_enabled")
+         else "📏 Фильтр расстояния: выкл — логика сломанного бота"),
     ]
+    if _duo_on():
+        from src import duo  # здесь: duo -> chainlink_feed, без циклов при старте
+        lines.append(duo.summary_line())
     own = _overrides_summary()
     if own:
         lines.append(f"⚙️ Свои у монет: {own}")
@@ -254,10 +262,19 @@ def _main_menu_text() -> str:
     return "\n".join(lines)
 
 
+def _duo_on() -> bool:
+    """Бот двух стратегий (src/duo.py) включён."""
+    return bool(runtime_state._state.get("strategies_mode", False))
+
+
 def _main_menu_markup() -> InlineKeyboardMarkup:
     paused = runtime_state.get("paused")
     rows = [
         [InlineKeyboardButton("▶️ Старт" if paused else "⏸ Стоп", callback_data="pause_toggle")],
+    ]
+    if _duo_on():
+        rows.append([InlineKeyboardButton("🎯 Стратегии", callback_data="duo:menu")])
+    rows += [
         [InlineKeyboardButton("🪙 Активы", callback_data="menu:assets")],
         [
             InlineKeyboardButton("💰 Размер позиции", callback_data="menu:size"),
@@ -316,12 +333,19 @@ def _assets_menu_text() -> str:
                   for a in settings.ASSETS if a in enabled]
     if coin_lines:
         lines += [""] + coin_lines
+    mode_line = (
+        "• посередине — 🔴 LIVE: стратегиям 🎯 можно входить по монете реальными деньгами (если "
+        "стратегия в «💵 реально» и бот в LIVE, иначе ⏳); 🧪 DRY — по монете только виртуальные "
+        "и тестовые входы;"
+        if _duo_on() else
+        "• посередине — режим: 🔴 LIVE — реальные сделки (только когда сам бот в LIVE, "
+        "иначе ⏳), 🧪 DRY — виртуальные: стратегия проверяется без денег;"
+    )
     lines += [
         "",
         "Кнопки в строке монеты:",
         "• слева — включить/выключить монету;",
-        "• посередине — режим: 🔴 LIVE — реальные сделки (только когда сам бот в LIVE, "
-        "иначе ⏳), 🧪 DRY — виртуальные: стратегия проверяется без денег;",
+        mode_line,
         "• ⚙️ — свой диапазон входа и своя ставка монеты (% банка или фикс. сумма). "
         "«⚙️ свои» — у монеты уже есть свои значения; без них она берёт общие из главного меню.",
         "",
@@ -722,6 +746,11 @@ def _settings_menu_markup() -> InlineKeyboardMarkup:
         InlineKeyboardButton(("✅ " if n == cur_pos else "") + str(n), callback_data=f"maxpos_set:{n}")
         for n in MAX_POS_PRESETS
     ])
+    rows.append([InlineKeyboardButton(
+        "📏 Фильтр расстояния: выкл (сломанный бот) — включить" if not runtime_state.get("distance_filter_enabled")
+        else "📏 Фильтр расстояния: вкл — выключить (как сломанный бот)",
+        callback_data="distf_toggle",
+    )])
     rows.append([InlineKeyboardButton("— 📏 Мин. расстояние от страйка —", callback_data="noop")])
     cur_dist = runtime_state.get("min_distance_pct") or 0.0
     drow = []
@@ -844,7 +873,13 @@ async def _cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         w.writerows(rows)
     live = storage.get_outcome_stats(live=True)
     caption = f"📥 Все сделки: {len(rows)}\n" + loss_stats.short_line("LIVE", live)
-    await send_document(path, caption)
+    if _duo_on():
+        try:
+            from src import duo_menu
+            caption += "\n" + "\n".join(duo_menu.report_lines(0)[:6])
+        except Exception:  # noqa: BLE001
+            pass
+    await send_document(path, caption[:1000])
 
 
 async def _cmd_start_or_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -891,6 +926,9 @@ async def _cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _stats_text() -> str:
+    if _duo_on():
+        from src import duo_menu
+        return duo_menu.stats_text()
     today_start = int(time.time() // 86400) * 86400
 
     t_live = storage.get_pnl_summary(today_start, live_only=True)
@@ -949,6 +987,17 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     raw = (update.message.text or "").strip().replace(",", ".")
+    if _pending_input.startswith("duo_n:"):
+        from src import duo_menu
+        res = duo_menu.apply_text_input(_pending_input, raw)
+        if res is not None:
+            text, markup = res
+            if markup is None:
+                await update.message.reply_text(text)   # ждём ввод дальше
+                return
+            _pending_input = None
+            await update.message.reply_text(text, reply_markup=markup)
+            return
     try:
         value = float(raw)
         if value < 0 or (value == 0 and _pending_input != "min_distance"):
@@ -1180,6 +1229,20 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
     _pending_input = None
 
     if await _handle_asset_cfg(query, data):
+        return
+
+    if data.startswith("duo:"):
+        from src import duo_menu
+        res = duo_menu.handle(data)
+        if res is not None:
+            text, markup, pending = res
+            _pending_input = pending
+            await _safe_edit(query, text, markup)
+            return
+
+    if data == "distf_toggle":
+        runtime_state.set("distance_filter_enabled", not runtime_state.get("distance_filter_enabled"))
+        await _safe_edit(query, _settings_text(), _settings_menu_markup())
         return
 
     if data == "menu:main":

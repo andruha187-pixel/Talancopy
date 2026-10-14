@@ -21,7 +21,7 @@ import os
 import time
 
 from config import settings
-from src import storage, telegram_notify, loss_stats, diagnostics
+from src import storage, telegram_notify, loss_stats, diagnostics, runtime_state
 
 _LAST_REPORT_KEY = "last_report_ts"
 
@@ -131,6 +131,20 @@ async def build_and_send_report() -> None:
         f"По токенам за период:\n{asset_lines}"
         f"{honest}"
     )
+    # Бот двух стратегий: вместо LIVE/DRY по монетам — итоги стратегий за период
+    # (виртуальные, 1️⃣ и 2️⃣ отдельно), разбивка по монетам — в CSV (колонка strategy).
+    if runtime_state._state.get("strategies_mode"):
+        try:
+            from src import duo_menu
+            caption = (
+                f"📄 Отчёт {from_label} → {to_label} (UTC)\n"
+                f"Тиков сигналов: {len(signals)} (с известным исходом: {labeled}) | сигналов на вход: {entered}\n"
+                f"Реальных сделок закрыто: {len(closed_live)} | побед: {wins} | PnL: {pnl_sum:+.2f} USDC\n\n"
+                + "\n".join(duo_menu.report_lines(since_ts))
+                + f"{honest}"
+            )
+        except Exception:  # noqa: BLE001 — строки стратегий не должны ломать отчёт
+            pass
     # Почему не входили: рынки без сигнала (по тикам окна) и сигналы без сделки
     # (лимит позиций, ошибки ордеров и т.п. — см. src/diagnostics.py).
     extra_lines = []

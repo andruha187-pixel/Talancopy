@@ -133,7 +133,12 @@ def evaluate(
     distance_atr = abs(current_price - strike_price) / atr
 
     time_score = _score_time_window(minutes_left, min_minutes_left, max_minutes_left)
-    distance_score = _score_distance(distance_atr, atr_distance_mult)
+    # Фильтр расстояния выключен (⚙️ → 📏) — логика «сломанного» бота 12–14.10:
+    # тогда из-за единиц цены Chainlink расстояние в ATR было «бесконечным», и
+    # бот входил по фаворитам без проверки расстояния. Расстояние считаем
+    # полным (100), минимум в % не проверяем; всё остальное — как обычно.
+    distance_filter = runtime_state._state.get("distance_filter_enabled", True)
+    distance_score = _score_distance(distance_atr, atr_distance_mult) if distance_filter else 100.0
     trend_score = _score_trend_alignment(direction, indicators["ema_fast_slope"], indicators["trend_up"], indicators["macd_bullish"])
     vol_score = _score_volatility_regime(indicators["atr_ratio_to_avg"], atr_spike_mult)
     liq_score = _score_liquidity(book, trade_size)
@@ -175,7 +180,7 @@ def evaluate(
     # Мин. расстояние от страйка в % от цены (0 = выкл). Жёсткое условие, как
     # и временное окно: в тихом рынке "много ATR" может быть всего $40-70 для
     # BTC, и именно на таких входах 15m ловил проигрыши (см. config.py).
-    min_distance_pct = runtime_state.get("min_distance_pct") or 0.0
+    min_distance_pct = (runtime_state.get("min_distance_pct") or 0.0) if distance_filter else 0.0
     distance_usd = abs(current_price - strike_price)
     distance_pct = distance_usd / strike_price * 100 if strike_price else 0.0
     distance_ok = min_distance_pct <= 0 or distance_pct >= min_distance_pct

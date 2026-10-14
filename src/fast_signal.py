@@ -41,7 +41,7 @@ import pandas as pd
 
 from config import settings
 from src import binance_feed, executor, indicators, polymarket_client, price_stream, runtime_state, storage, strategy
-from src import entry_confirm, chainlink_feed
+from src import entry_confirm, chainlink_feed, duo
 from src.market_discovery import ActiveMarket
 from src.polymarket_client import OrderBookSnapshot
 from src.timeframes import TIMEFRAMES, TimeframeProfile
@@ -217,7 +217,10 @@ def check(asset: str, timeframe: TimeframeProfile, market: ActiveMarket, now: fl
         return "range"
     if executor.entry_busy(market.slug, now):
         return "busy"
-    if storage.get_open_trade_for_market(market.slug):
+    # Бот двух стратегий: по рынку уже есть виртуальная сделка, и ни одна
+    # стратегия сейчас войти не хочет (src/duo.py) — делать нечего.
+    if (duo.market_done(market.slug, now) if duo.enabled()
+            else storage.get_open_trade_for_market(market.slug)):
         return "open"
     ind = indicators_now(asset, timeframe, ticker)
     if ind is None:

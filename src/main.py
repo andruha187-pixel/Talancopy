@@ -24,7 +24,7 @@ from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
 from src.market_discovery import ActiveMarket
 from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot
-from src import price_stream, fast_signal, entry_confirm, chainlink_feed
+from src import price_stream, fast_signal, entry_confirm, chainlink_feed, duo
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -248,6 +248,9 @@ async def main():
     # Инициализация БД и настроек — до старта любых фоновых задач.
     storage.init_db()
     runtime_state.init_from_db()
+    # Бот двух стратегий: виртуальные сделки, исходы и входы стратегий за
+    # последние часы — из базы (src/duo.py)
+    duo.init()
 
     # Защита от "тихого" LIVE без ключа: если в БД с прошлого раза сохранён
     # LIVE-режим, а сейчас POLY_PRIVATE_KEY не задан (новый хостинг, забыли
@@ -300,6 +303,12 @@ async def main():
             if chainlink_feed.mode() == "chainlink" else
             "📡 Цена сигнала: Binance."
         )
+        if not runtime_state.get("distance_filter_enabled"):
+            fast_note += "\n📏 Фильтр расстояния: выкл — логика «сломанного» бота (⚙️ Настройки)."
+        if duo.enabled():
+            fast_note += ("\n" + duo.summary_line() + "\nКаждый сигнал — виртуальная сделка, реальные "
+                          "входы делают стратегии (🎯 Стратегии в меню). 🔴 у монеты — стратегиям можно "
+                          "входить по ней реальными деньгами, 🧪 — только тест.")
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
             f"Активы: {assets_line} (🔴 реальные сделки, 🧪 DRY)\nТаймфреймы: {timeframes_line}\n"
@@ -317,6 +326,8 @@ async def main():
         price_stream_task = asyncio.create_task(price_stream.run_forever())
         # Цена Chainlink — потоки цен Polymarket (PolyBolt и старый RTDS)
         chainlink_task = asyncio.create_task(chainlink_feed.run_forever())
+        # Исходы рынков для стратегий — через ~2 с после конца рынка (src/duo.py)
+        duo_task = asyncio.create_task(duo.run_forever())
         fast_task = (asyncio.create_task(fast_signal.run_forever(_active_markets))
                      if settings.USE_LIVE_BOOK_STREAM else None)
 
@@ -338,6 +349,7 @@ async def main():
                 book_stream_task.cancel()
             price_stream_task.cancel()
             chainlink_task.cancel()
+            duo_task.cancel()
             if fast_task:
                 fast_task.cancel()
             report_task.cancel()

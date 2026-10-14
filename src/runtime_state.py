@@ -22,6 +22,24 @@ SIZING_KEYS = ("sizing_mode", "trade_size_usdc", "bankroll_pct")
 _OVERRIDE_FLOAT_KEYS = ("min_entry_price", "max_entry_price", "trade_size_usdc", "bankroll_pct")
 
 
+def _parse_counts(raw) -> dict:
+    """JSON {"sol": 8, "btc": 2} -> {"sol": 8, "btc": 2}: целые ≥ 0, монеты в
+    нижнем регистре. Битые значения молча отбрасываем."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for asset, n in data.items():
+        try:
+            out[str(asset).lower()] = max(0, int(float(n)))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 def _parse_overrides(raw) -> dict:
     """JSON из базы -> {"sol": {"min_entry_price": 0.92, ...}, ...}. Битые или
     неизвестные поля молча отбрасываем: настройки не должны ронять старт."""
@@ -134,6 +152,23 @@ _DEFAULTS = {
     "hedge_entry_price": 0.70,
     "hedge_trigger_price": 0.90,
     "hedge_stake_usdc": 5.0,
+    # --- Две стратегии (src/duo.py) ---
+    # Сигнал = виртуальная сделка, реальные входы — по стратегиям 1️⃣ и 2️⃣.
+    "strategies_mode": settings.STRATEGIES_MODE,
+    # Фильтр расстояния от страйка (1.5 ATR и минимум в %). Выкл — логика
+    # «сломанного» бота: расстояние не проверяется.
+    "distance_filter_enabled": settings.DISTANCE_FILTER_ENABLED,
+    "strat_a_enabled": settings.STRAT_A_ENABLED,
+    "strat_a_live": settings.STRAT_A_LIVE,
+    # Сколько входов после проигрыша у каждой монеты (нет в словаре — STRAT_A_DEFAULT_N)
+    "strat_a_counts": _parse_counts(settings.STRAT_A_COUNTS),
+    "strat_b_enabled": settings.STRAT_B_ENABLED,
+    "strat_b_live": settings.STRAT_B_LIVE,
+    "strat_b_pause_min": max(1, settings.STRAT_B_PAUSE_MIN),
+    # Пауза 2️⃣: "coin" — у каждой монеты своя, "all" — общая на все монеты
+    "strat_b_scope": "all" if settings.STRAT_B_SCOPE == "all" else "coin",
+    # Состояние стратегии 1️⃣: сколько входов осталось в текущей серии по монете
+    "duo_a_remaining": {},
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -170,6 +205,16 @@ _CASTERS = {
     "hedge_entry_price": float,
     "hedge_trigger_price": float,
     "hedge_stake_usdc": float,
+    "strategies_mode": lambda v: str(v).lower() == "true",
+    "distance_filter_enabled": lambda v: str(v).lower() == "true",
+    "strat_a_enabled": lambda v: str(v).lower() == "true",
+    "strat_a_live": lambda v: str(v).lower() == "true",
+    "strat_a_counts": _parse_counts,
+    "strat_b_enabled": lambda v: str(v).lower() == "true",
+    "strat_b_live": lambda v: str(v).lower() == "true",
+    "strat_b_pause_min": lambda v: max(1, int(float(v))),
+    "strat_b_scope": lambda v: "all" if str(v).lower() == "all" else "coin",
+    "duo_a_remaining": _parse_counts,
 }
 
 _state: dict = dict(_DEFAULTS)
@@ -526,3 +571,25 @@ def reset_asset_sizing(asset: str) -> None:
 
 def reset_asset(asset: str) -> None:
     _update_asset(asset, remove=RANGE_KEYS + SIZING_KEYS)
+
+
+# --- Две стратегии: N входов после проигрыша по монете (стратегия 1️⃣) ---
+
+STRAT_A_MAX_N = 50
+STRAT_B_PAUSE_PRESETS = (30, 60, 120)
+
+
+def strat_a_count(asset: str) -> int:
+    """Сколько входов делает стратегия 1️⃣ после проигрыша монеты (0 — по
+    монете не входит)."""
+    counts = _state.get("strat_a_counts") or {}
+    n = counts.get(asset.lower())
+    return int(n) if n is not None else max(0, int(settings.STRAT_A_DEFAULT_N))
+
+
+def set_strat_a_count(asset: str, n: int) -> int:
+    n = max(0, min(STRAT_A_MAX_N, int(n)))
+    counts = dict(_state.get("strat_a_counts") or {})
+    counts[asset.lower()] = n
+    set("strat_a_counts", counts)
+    return n
