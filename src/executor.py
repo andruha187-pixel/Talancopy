@@ -245,12 +245,12 @@ async def _enter_duo(market: ActiveMarket, decision: Decision, path: str) -> Non
     if not duo.has_virtual(slug):
         row = storage.get_open_trade_for_market(slug, strategy=duo.VIRT)
         if row is not None:
-            duo.on_virtual_logged(row[0], slug, row[2])
+            duo.on_virtual_logged(row[0], slug, row[2], market.up_token_id, market.down_token_id)
         else:
             tid = await _enter_sized(market, decision, path, True, strategy=duo.VIRT)
             if tid is None:
                 return  # не записалась (мало ликвидности) — повторим на следующем сигнале
-            duo.on_virtual_logged(tid, slug, decision.direction)
+            duo.on_virtual_logged(tid, slug, decision.direction, market.up_token_id, market.down_token_id)
     want = duo.wanted(asset, slug)
     if not want:
         return

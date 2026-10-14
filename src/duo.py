@@ -22,17 +22,20 @@
 своей меткой), «💵 реально» — реальный ордер, если бот в LIVE и монета
 🔴 LIVE в 🪙 Активах. Ставка общая (💰 Размер позиции, своя у монеты в ⚙️).
 
-Результат рынка бот узнаёт сам через ~2 с после конца: цена Chainlink на
-конце окна против страйка — так решает Polymarket (Up, если цена на конце не
-ниже цены на начале). Нет данных или цена у самого страйка — ждёт
-официальную резолюцию (settlement_loop, обычно 1–3 мин).
+Результат рынка бот узнаёт сам в момент конца — по стакану: в последние
+секунды у стороны-победителя нет продавцов (или ask ≥ 0.97), а сторону-
+проигравшего продают по ≤ 0.03. Отчёты 11–14.10 (1100+ рынков, ~13 000
+проверок стакана за последние 13 с) — ни одного расхождения с официальным
+исходом. Сравнение по нашему потоку Chainlink (цена на конце против страйка)
+ошибалось в 11% рынков — оно больше не используется. Стакан не решил или
+бот его не видел — ждёт официальную резолюцию (settlement_loop).
 """
 from __future__ import annotations
 import asyncio
 import logging
 import time
 
-from src import chainlink_feed, runtime_state, storage
+from src import book_stream, runtime_state, storage
 
 log = logging.getLogger("polymarket-bot")
 
@@ -43,17 +46,22 @@ SHORT = {VIRT: "👻", A: "1️⃣", B: "2️⃣"}
 _ENABLED_KEY = {A: "strat_a_enabled", B: "strat_b_enabled"}
 _LIVE_KEY = {A: "strat_a_live", B: "strat_b_live"}
 
-EARLY_DELAY_SEC = 2.0      # через сколько после конца рынка смотреть цену закрытия
-EARLY_GIVE_UP_SEC = 90.0   # не нашли цену — ждём официальную резолюцию
-TIE_REL = 0.00002          # ближе 0.002% к страйку — не гадаем, ждём официальную
+BOOK_WINDOW_SEC = 12.0     # смотрим стакан рынка в его последние 12 с
+BOOK_LAST_SEC = 3.0        # решает чтение не раньше чем за 3 с до конца
+BOOK_LO, BOOK_HI = 0.03, 0.97
+BOOK_MAX_AGE_MS = 30_000   # стакан, который не обновлялся дольше, — не верим
+EARLY_DELAY_SEC = 0.5      # через сколько после конца рынка применить исход по стакану
 HISTORY_SEC = 6 * 3600     # сколько истории поднимать из базы при старте и держать в памяти
-LOOP_SEC = 1.0
+LOOP_SEC = 0.5
 _UPDOWN = ("UP", "DOWN")
 
 # slug -> {"id", "asset", "direction", "start", "end"} — виртуальные сделки
 _virtual: dict[str, dict] = {}
 # Слаги, чей исход ещё не применён к стратегиям (ждём конца рынка)
 _pending: set[str] = set()
+# slug -> (победитель по стакану или None, время чтения) — последнее чтение
+# стакана в последние секунды рынка
+_book_last: dict[str, tuple[str | None, float]] = {}
 # slug -> исход, уже применённый к стратегиям (ранний или официальный)
 _applied: dict[str, str] = {}
 # (slug, "A"/"B") — стратегия уже вошла в этот рынок
@@ -202,12 +210,13 @@ def market_done(slug: str, now: float | None = None) -> bool:
 
 # ------------------------------------------------- события executor ----
 
-def on_virtual_logged(trade_id: int, slug: str, direction: str) -> None:
+def on_virtual_logged(trade_id: int, slug: str, direction: str,
+                      up_token: str | None = None, down_token: str | None = None) -> None:
     b = _bounds(slug)
     if b is None:
         return
     _virtual[slug] = {"id": trade_id, "asset": _asset_of(slug), "direction": direction,
-                      "start": b[0], "end": b[1]}
+                      "start": b[0], "end": b[1], "up": up_token, "down": down_token}
     if slug not in _applied:
         _pending.add(slug)
     _prune()
@@ -266,42 +275,55 @@ def _apply(slug: str, direction: str, outcome: str) -> bool:
     return True
 
 
-def early_outcome(asset: str, slug: str, start: float, end: float) -> str | None:
-    """Исход по Chainlink: цена на конце окна против страйка (цены на начале).
-    None — данных нет или цена у самого страйка (не гадаем)."""
-    strike = chainlink_feed.strike_for(slug, asset, start)
-    close = chainlink_feed.price_after(asset, end)
-    if strike is None or close is None or strike <= 0:
+def book_winner(up_token: str | None, down_token: str | None) -> str | None:
+    """Победитель по живому стакану в последние секунды рынка: у победителя
+    нет продавцов (или ask ≥ 0.97), проигравшего продают по ≤ 0.03. None —
+    стакан не решил, его нет или он давно не обновлялся."""
+    if not up_token or not down_token:
         return None
-    if abs(close - strike) / strike < TIE_REL:
+    ub, db = book_stream.get_book(up_token), book_stream.get_book(down_token)
+    if not ub or not db:
         return None
-    return "UP" if close >= strike else "DOWN"
+    fresh = max(ub.get("received_ms") or 0, db.get("received_ms") or 0)
+    if book_stream.now_ms() - fresh > BOOK_MAX_AGE_MS:
+        return None
+    ua, da = book_stream.best_ask(up_token), book_stream.best_ask(down_token)
+    if da is not None and da <= BOOK_LO and (ua is None or ua >= BOOK_HI):
+        return "UP"
+    if ua is not None and ua <= BOOK_LO and (da is None or da >= BOOK_HI):
+        return "DOWN"
+    return None
 
 
 def check_pending(now: float | None = None) -> int:
-    """Узнать исходы закончившихся рынков с виртуальной сделкой. Возвращает,
-    сколько применили."""
+    """Последние секунды рынков с виртуальной сделкой — читаем стакан; сразу
+    после конца применяем исход по последнему чтению. Возвращает, сколько
+    исходов применили."""
     now = time.time() if now is None else now
     done = 0
     for slug in list(_pending):
         v = _virtual.get(slug)
         if v is None or slug in _applied:
             _pending.discard(slug)
+            _book_last.pop(slug, None)
+            continue
+        if now < v["end"]:
+            if now >= v["end"] - BOOK_WINDOW_SEC:
+                _book_last[slug] = (book_winner(v.get("up"), v.get("down")), now)
             continue
         if now < v["end"] + EARLY_DELAY_SEC:
             continue
-        res = early_outcome(v["asset"], slug, v["start"], v["end"])
-        if res is not None:
-            _pending.discard(slug)
-            try:
-                storage.set_early_outcome(v["id"], res)
-            except Exception as exc:  # noqa: BLE001 — запись в базу не должна мешать стратегиям
-                log.warning("Не записал ранний исход %s: %s", slug, exc)
-            _apply(slug, v["direction"], res)
-            _stats["early"] += 1
-            done += 1
-        elif now > v["end"] + EARLY_GIVE_UP_SEC:
-            _pending.discard(slug)   # дождёмся официальной резолюции
+        _pending.discard(slug)
+        res, t = _book_last.pop(slug, (None, 0.0))
+        if res is None or t < v["end"] - BOOK_LAST_SEC:
+            continue   # стакан не решил или его не видели — ждём официальную резолюцию
+        try:
+            storage.set_early_outcome(v["id"], res)
+        except Exception as exc:  # noqa: BLE001 — запись в базу не должна мешать стратегиям
+            log.warning("Не записал ранний исход %s: %s", slug, exc)
+        _apply(slug, v["direction"], res)
+        _stats["early"] += 1
+        done += 1
     return done
 
 
@@ -330,6 +352,7 @@ def _prune(now: float | None = None) -> None:
         _virtual.pop(s, None)
         _applied.pop(s, None)
         _pending.discard(s)
+        _book_last.pop(s, None)
     for key in [k for k in _entered if k[0] in old]:
         _entered.discard(key)
 
@@ -340,6 +363,7 @@ def init(now: float | None = None) -> None:
     now = time.time() if now is None else now
     _virtual.clear()
     _pending.clear()
+    _book_last.clear()
     _applied.clear()
     _entered.clear()
     _losses.clear()
@@ -362,7 +386,8 @@ def init(now: float | None = None) -> None:
 
 
 async def run_forever() -> None:
-    """Фоновая задача: раз в секунду узнаёт исходы закончившихся рынков."""
+    """Фоновая задача: раз в 0.5 с смотрит стаканы рынков в их последние
+    секунды и применяет исходы закончившихся."""
     while True:
         try:
             if enabled():
@@ -448,8 +473,8 @@ def early_stats_text() -> str:
     e, late, mm = _stats["early"], _stats["late"], _stats["mismatch"]
     if not e and not late:
         return ""
-    return (f"Исход рынка: сам через ~2 с после конца — {e}, ждал официальный — {late}"
-            + (f", ранний не совпал с официальным: {mm}" if mm else ""))
+    return (f"Исход рынка: по стакану в момент конца — {e}, ждал официальный — {late}"
+            + (f", по стакану не совпал с официальным: {mm}" if mm else ""))
 
 
 def compare_pause(since_ts: int = 0) -> dict[str, dict]:

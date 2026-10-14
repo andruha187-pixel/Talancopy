@@ -326,7 +326,7 @@ async def main():
         price_stream_task = asyncio.create_task(price_stream.run_forever())
         # Цена Chainlink — потоки цен Polymarket (PolyBolt и старый RTDS)
         chainlink_task = asyncio.create_task(chainlink_feed.run_forever())
-        # Исходы рынков для стратегий — через ~2 с после конца рынка (src/duo.py)
+        # Исходы рынков для стратегий — по стакану в момент конца рынка (src/duo.py)
         duo_task = asyncio.create_task(duo.run_forever())
         fast_task = (asyncio.create_task(fast_signal.run_forever(_active_markets))
                      if settings.USE_LIVE_BOOK_STREAM else None)
