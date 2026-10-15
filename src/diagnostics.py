@@ -25,6 +25,8 @@ SKIP_LABELS = {
     "order_error": "ошибка ордера",
     "paused": "пауза",
     "no_bank": "банк исчерпан",
+    "filter_time": "фильтр: мало времени до конца",
+    "filter_spread": "фильтр: широкий спред",
 }
 
 _skips: Counter = Counter()      # (asset, reason) -> число рынков

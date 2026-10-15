@@ -241,26 +241,46 @@ async def _enter_duo(market: ActiveMarket, decision: Decision, path: str) -> Non
     входы стратегий 1️⃣ и 2️⃣, если они сейчас хотят в этот рынок."""
     slug, asset = market.slug, market.asset
     # 1) Виртуальная сделка — по каждому сигналу, в том числе на паузе ⏸: по
-    # ним стратегии «читают» рынок.
+    # ним стратегии «читают» рынок. Фильтры входа (🎯 → 🧹) решают здесь же,
+    # один раз на рынок: пускать ли в него стратегии.
     if not duo.has_virtual(slug):
         row = storage.get_open_trade_for_market(slug, strategy=duo.VIRT)
         if row is not None:
-            duo.on_virtual_logged(row[0], slug, row[2], market.up_token_id, market.down_token_id)
+            duo.on_virtual_logged(row[0], slug, row[2], market.up_token_id, market.down_token_id,
+                                  filtered=storage.trade_filtered(row[0]))
         else:
-            tid = await _enter_sized(market, decision, path, True, strategy=duo.VIRT)
+            filtered = duo.entry_filter_reason(decision)
+            tid = await _enter_sized(market, decision, path, True, strategy=duo.VIRT,
+                                     size_override=duo.VIRT_STAKE,
+                                     features=duo.entry_features(decision, filtered))
             if tid is None:
                 return  # не записалась (мало ликвидности) — повторим на следующем сигнале
-            duo.on_virtual_logged(tid, slug, decision.direction, market.up_token_id, market.down_token_id)
+            duo.on_virtual_logged(tid, slug, decision.direction, market.up_token_id, market.down_token_id,
+                                  filtered=filtered)
+    reason = duo.market_filtered(slug)
+    if reason:
+        diagnostics.record_skip(slug, asset, f"filter_{reason}")
+        return
     want = duo.wanted(asset, slug)
     if not want:
         return
     if runtime_state.get("paused"):
         diagnostics.record_skip(slug, asset, "paused")
         return
-    # 2) Стратегии — по очереди; у каждой своя сделка в рынке
+    # 2) Стратегии — по очереди; у каждой своя сделка в рынке. Ставку считает
+    # src/duo.py: фикс. или % банка монеты; у 1️⃣ в режиме отыгрыша — сумма,
+    # которая вернёт минус 2️⃣ по этой монете (по худшей цене — потолку ордера).
+    _lo, range_max = runtime_state.entry_range(asset)
+    cap = min(decision.entry_price + settings.LIVE_ENTRY_MAX_SLIPPAGE, settings.MAX_ENTRY_EXECUTION_PRICE, range_max)
     for strat in want:
-        dry_run = duo.is_dry(strat, asset)
+        dry_run = duo.entry_dry(strat, asset)
         key = f"{slug}#{strat}"
+        stake = duo.stake_for(strat, asset, dry_run, cap)
+        note = ""
+        if strat == duo.A and duo.a_mode() == "recover":
+            target = duo.recover_target(asset, dry_run)
+            note = (f"🩹 Отыгрыш минуса 2️⃣: ${target:.2f} → ставка ${stake:.2f} (по цене до {cap:.2f}, "
+                    f"банк {asset.upper()} ${duo.coin_bank(asset, dry_run):.2f})")
         if not dry_run:
             if await _daily_limit_hit(market):
                 continue   # реальный вход нельзя, тестовый другой стратегии — можно
@@ -271,11 +291,12 @@ async def _enter_duo(market: ActiveMarket, decision: Decision, path: str) -> Non
                 continue
             _inflight_live.add(key)
         try:
-            tid = await _enter_sized(market, decision, path, dry_run, strategy=strat)
+            tid = await _enter_sized(market, decision, path, dry_run, strategy=strat,
+                                     size_override=stake, note=note)
         finally:
             _inflight_live.discard(key)
         if tid is not None:
-            duo.on_strategy_entered(strat, slug)
+            duo.on_strategy_entered(strat, slug, dry_run)
 
 
 async def _enter_locked(market: ActiveMarket, decision: Decision, path: str) -> None:
@@ -325,19 +346,44 @@ async def _enter_locked(market: ActiveMarket, decision: Decision, path: str) -> 
 _STRAT_TAG = {"virt": "👻 ", "A": "1️⃣ ", "B": "2️⃣ "}
 
 
+def _dry_fill_price(token_id: str, book, cap: float, usdc: float) -> float:
+    """Цена, по которой виртуальная/тестовая сделка исполнилась бы ордером
+    сейчас: средняя по уровням asks не дороже потолка на сумму ставки. Раньше
+    писали сам потолок (ask + 1¢), а реальные ордера 13–15.10 исполнялись в
+    среднем ровно по ask сигнала — тестовая статистика выходила хуже реальной
+    примерно на 1¢ с доллара. Уровней нет — потолок, как раньше."""
+    levels = book.asks
+    if levels is None:
+        b = book_stream.get_book(token_id)
+        levels = list((b.get("asks") or {}).items()) if b else None
+    if not levels:
+        return cap
+    spent = shares = 0.0
+    for price, size in sorted((float(p), float(sz)) for p, sz in levels):
+        if price > cap + 1e-9 or spent >= usdc - 1e-9:
+            break
+        take = min(price * size, usdc - spent)
+        spent += take
+        shares += take / price
+    return round(spent / shares, 4) if shares > 0 else cap
+
+
 async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_run: bool,
-                       strategy: str | None = None) -> int | None:
+                       strategy: str | None = None, size_override: float | None = None,
+                       note: str = "", features: dict | None = None) -> int | None:
     """Вход с размером ставки. Возвращает id записанной сделки или None, если
-    сделки нет. strategy — метка сделки в боте двух стратегий (src/duo.py)."""
+    сделки нет. strategy — метка сделки в боте двух стратегий (src/duo.py),
+    size_override — ставка, посчитанная там же (без масштабирования по score),
+    note — строка в уведомление."""
     # Ставка и диапазон — свои у монеты (⚙️ в 🪙 Активах), иначе общие
-    base_size = runtime_state.compute_trade_size(market.asset)
+    base_size = runtime_state.compute_trade_size(market.asset) if size_override is None else size_override
     range_min, range_max = runtime_state.entry_range(market.asset)
     if base_size <= 0:
         diagnostics.record_skip(market.slug, market.asset, "no_bank")
         _cool_down(market.slug)
         return None  # банк в режиме % исчерпан — ставить нечего
     score_threshold = runtime_state.get("safety_score_threshold")
-    if runtime_state.get("size_scaling_enabled"):
+    if runtime_state.get("size_scaling_enabled") and size_override is None:
         trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
     else:
         trade_size = base_size
@@ -397,7 +443,7 @@ async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_
     order_id = "dry-run"
     first_cap = execution_price
     attempts = 1
-    entry_logged = execution_price
+    entry_logged = _dry_fill_price(token_id, book, execution_price, trade_size) if dry_run else execution_price
     if not dry_run:
         if not settings.POLY_PRIVATE_KEY:
             # Не должно случиться благодаря проверкам в telegram_notify/main.py,
@@ -431,6 +477,7 @@ async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_
         range_min=range_min,
         range_max=range_max,
         entry_path=path,
+        features=features if features is not None else duo.entry_features(decision),
         strategy=strategy,
     )
 
@@ -443,6 +490,7 @@ async def _enter_sized(market: ActiveMarket, decision: Decision, path: str, dry_
         + (f"Исполнено по средней {entry_logged:.3f} за {attempts} попытки\n" if not dry_run and attempts > 1 else "")
         + f"Диапазон {range_min:.2f}–{range_max:.2f} | Расхождение: {decision.distance_atr} ATR | "
         f"До конца рынка: {decision.minutes_left:.1f} мин"
+        + (f"\n{note}" if note else "")
     )
     return trade_id
 
@@ -561,6 +609,8 @@ async def settle_resolved_trades() -> None:
                 duo.on_official(market_slug, direction, outcome, early)
             except Exception:  # noqa: BLE001 — стратегии не должны ломать резолюцию
                 pass
+        elif strategy in ("A", "B"):
+            duo.invalidate_banks()   # банк монеты изменился
 
         asset, _label = storage.parse_market_slug(market_slug)
         emoji = "🟢" if won else "🔴"

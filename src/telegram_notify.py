@@ -987,7 +987,7 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     raw = (update.message.text or "").strip().replace(",", ".")
-    if _pending_input.startswith("duo_n:"):
+    if _pending_input.startswith(("duo_n:", "duo_bank:")):
         from src import duo_menu
         res = duo_menu.apply_text_input(_pending_input, raw)
         if res is not None:

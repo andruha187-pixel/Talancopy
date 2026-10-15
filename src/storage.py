@@ -221,7 +221,21 @@ _TRADES_MIGRATIONS = [
     # Исход, который бот определил сам в момент конца рынка (по стакану в
     # последние секунды) — только у виртуальных сделок; outcome — официальный.
     ("early_outcome", "TEXT"),
+    # Признаки входа — чтобы по выгрузке подгонять фильтры: минут до конца,
+    # ask другой стороны и спред (цена + ask другой стороны − 1), запас до
+    # страйка в % и в ATR, волатильность (ATR к среднему). filtered — почему
+    # фильтры входа бота двух стратегий не пустили стратегии в этот рынок
+    # ("spread" / "time"), пусто — пустили (или фильтры выключены).
+    ("minutes_left", "REAL"),
+    ("opp_ask", "REAL"),
+    ("spread", "REAL"),
+    ("distance_pct", "REAL"),
+    ("distance_atr", "REAL"),
+    ("atr_ratio", "REAL"),
+    ("filtered", "TEXT"),
 ]
+
+FEATURE_COLUMNS = ("minutes_left", "opp_ask", "spread", "distance_pct", "distance_atr", "atr_ratio", "filtered")
 
 
 @contextmanager
@@ -329,17 +343,22 @@ def log_trade(market_slug: str, condition_id: str, direction: str, entry_price: 
               source: str = "strategy", signal_ask: float | None = None,
               safety_score: float | None = None, range_min: float | None = None,
               range_max: float | None = None, entry_path: str | None = None,
-              strategy: str | None = None) -> int:
+              strategy: str | None = None, features: dict | None = None) -> int:
+    """features — признаки входа (FEATURE_COLUMNS), чего нет — NULL."""
+    f = features or {}
     with _conn() as conn:
         cur = conn.execute(
-            """INSERT INTO trades
+            f"""INSERT INTO trades
                (ts, market_slug, condition_id, direction, entry_price, size_usdc,
                 order_id, status, outcome, pnl_usdc, dry_run, token_id, source,
-                signal_ask, safety_score, range_min, range_max, entry_path, strategy)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                signal_ask, safety_score, range_min, range_max, entry_path, strategy,
+                {", ".join(FEATURE_COLUMNS)})
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       {", ".join("?" for _ in FEATURE_COLUMNS)})""",
             (int(time.time()), market_slug, condition_id, direction, entry_price,
              size_usdc, order_id, status, int(dry_run), token_id, source,
-             signal_ask, safety_score, range_min, range_max, entry_path, strategy),
+             signal_ask, safety_score, range_min, range_max, entry_path, strategy,
+             *(f.get(c) for c in FEATURE_COLUMNS)),
         )
         return cur.lastrowid
 
@@ -564,6 +583,7 @@ TRADES_COLUMNS = [
     "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id", "source",
     "signal_ask", "safety_score", "range_min", "range_max", "entry_path",
     "strategy", "early_outcome",
+    "minutes_left", "opp_ask", "spread", "distance_pct", "distance_atr", "atr_ratio", "filtered",
 ]
 
 
@@ -685,6 +705,53 @@ def virtual_trades_since(since_ts: int) -> list[tuple]:
         ).fetchall()
 
 
+def virtual_filtered_since(since_ts: int) -> dict[str, str]:
+    """{market_slug: причина} виртуальных сделок, рынки которых фильтры входа
+    закрыли для стратегий (для восстановления состояния при старте)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT market_slug, filtered FROM trades WHERE strategy = 'virt' AND ts >= ? "
+            "AND filtered IS NOT NULL AND filtered != ''", (since_ts,),
+        ).fetchall()
+    return {slug: reason for slug, reason in rows}
+
+
+def filter_summary(since_ts: int = 0) -> dict[str, dict]:
+    """Виртуальные сделки с официальным исходом по результату фильтров входа:
+    {"" — прошли (или фильтры были выкл), "spread", "time": {"trades",
+    "losses", "expected_losses", "pnl_usdc"}}."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT COALESCE(filtered, ''), entry_price, direction, outcome, pnl_usdc FROM trades "
+            "WHERE strategy = 'virt' AND outcome IN ('UP', 'DOWN') AND ts >= ?", (since_ts,),
+        ).fetchall()
+    out: dict[str, dict] = {}
+    for reason, price, direction, outcome, pnl in rows:
+        b = out.setdefault(reason, {"trades": 0, "losses": 0, "expected_losses": 0.0, "pnl_usdc": 0.0})
+        b["trades"] += 1
+        b["losses"] += int(direction != outcome)
+        b["expected_losses"] += 1.0 - float(price or 0)
+        b["pnl_usdc"] += pnl or 0.0
+    return out
+
+
+def virtual_feature_rows(since_ts: int = 0) -> list[tuple]:
+    """Виртуальные сделки с официальным исходом и признаками входа:
+    (entry_price, direction, outcome, pnl_usdc, minutes_left, spread)."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT entry_price, direction, outcome, pnl_usdc, minutes_left, spread FROM trades "
+            "WHERE strategy = 'virt' AND outcome IN ('UP', 'DOWN') AND ts >= ?", (since_ts,),
+        ).fetchall()
+
+
+def trade_filtered(trade_id: int) -> str:
+    """Причина фильтра входа у сделки ("" — нет)."""
+    with _conn() as conn:
+        row = conn.execute("SELECT filtered FROM trades WHERE id = ?", (trade_id,)).fetchone()
+    return (row[0] or "") if row else ""
+
+
 def strategy_entries_since(since_ts: int) -> list[tuple]:
     """(market_slug, strategy) входов стратегий 1️⃣ и 2️⃣ с момента since_ts."""
     with _conn() as conn:
@@ -726,3 +793,24 @@ def virtual_results_since(since_ts: int) -> list[tuple]:
         if res is not None:
             out.append((int(ts), slug, float(price or 0), res == direction, pnl))
     return out
+
+
+def strategy_trade(market_slug: str, strategy: str):
+    """Сделка стратегии в рынке: (id, size_usdc, dry_run, direction) или None."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT id, size_usdc, dry_run, direction FROM trades WHERE market_slug = ? AND strategy = ? "
+            "ORDER BY id ASC LIMIT 1", (market_slug, strategy),
+        ).fetchone()
+
+
+def coin_strategy_pnl(asset: str, dry: bool) -> float:
+    """Итог закрытых сделок стратегий 1️⃣ и 2️⃣ по монете: реальных (dry=False)
+    или тестовых (dry=True) — для банка монеты."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(pnl_usdc), 0) FROM trades WHERE outcome IS NOT NULL "
+            "AND strategy IN ('A', 'B') AND dry_run = ? AND market_slug LIKE ?",
+            (1 if dry else 0, f"{asset.lower()}-updown-%"),
+        ).fetchone()
+    return float(row[0] or 0.0)

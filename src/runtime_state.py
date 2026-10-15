@@ -40,6 +40,46 @@ def _parse_counts(raw) -> dict:
     return out
 
 
+def _parse_floats(raw) -> dict:
+    """JSON {"sol": 100} -> {"sol": 100.0} (суммы ≥ 0)."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for asset, v in data.items():
+        try:
+            out[str(asset).lower()] = max(0.0, float(v))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _parse_recover(raw) -> dict:
+    """JSON несыгранных минусов: {"sol": [{"slug", "amount", "dry"}, ...]}."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    for asset, items in data.items():
+        if not isinstance(items, list):
+            continue
+        clean = []
+        for it in items:
+            try:
+                clean.append({"slug": str(it["slug"]), "amount": float(it["amount"]), "dry": bool(it["dry"])})
+            except (KeyError, TypeError, ValueError):
+                pass
+        if clean:
+            out[str(asset).lower()] = clean
+    return out
+
+
 def _parse_overrides(raw) -> dict:
     """JSON из базы -> {"sol": {"min_entry_price": 0.92, ...}, ...}. Битые или
     неизвестные поля молча отбрасываем: настройки не должны ронять старт."""
@@ -165,8 +205,20 @@ _DEFAULTS = {
     "strat_b_enabled": settings.STRAT_B_ENABLED,
     "strat_b_live": settings.STRAT_B_LIVE,
     "strat_b_pause_min": max(1, settings.STRAT_B_PAUSE_MIN),
-    # Пауза 2️⃣: "coin" — у каждой монеты своя, "all" — общая на все монеты
-    "strat_b_scope": "all" if settings.STRAT_B_SCOPE == "all" else "coin",
+    # Пауза 2️⃣: "all" — общая на все монеты, "coin" — у каждой монеты своя
+    "strat_b_scope": "coin" if settings.STRAT_B_SCOPE == "coin" else "all",
+    # Фильтры входа стратегий: минимум минут до конца, максимум спреда (0 — выкл)
+    "entry_min_minutes_left": max(0.0, settings.ENTRY_MIN_MINUTES_LEFT),
+    "entry_max_spread": max(0.0, settings.ENTRY_MAX_SPREAD),
+    # Разовый переход на настройки 15.10 (общая пауза, фильтр 2 мин, тест) уже был
+    "duo_defaults_v3": False,
+    # Режим 1️⃣: "recover" — отыгрыш минуса 2️⃣, "series" — N входов после проигрыша
+    "strat_a_mode": "series" if settings.STRAT_A_MODE == "series" else "recover",
+    # Стартовый банк монеты (нет в словаре — COIN_BANK_USDC)
+    "coin_banks": {},
+    # Отыгрыш 1️⃣: несыгранные минусы 2️⃣ по монетам
+    # {"sol": [{"slug": ..., "amount": 5.0, "dry": true}, ...]}
+    "duo_recover": {},
     # Состояние стратегии 1️⃣: сколько входов осталось в текущей серии по монете
     "duo_a_remaining": {},
 }
@@ -213,7 +265,13 @@ _CASTERS = {
     "strat_b_enabled": lambda v: str(v).lower() == "true",
     "strat_b_live": lambda v: str(v).lower() == "true",
     "strat_b_pause_min": lambda v: max(1, int(float(v))),
-    "strat_b_scope": lambda v: "all" if str(v).lower() == "all" else "coin",
+    "strat_b_scope": lambda v: "coin" if str(v).lower() == "coin" else "all",
+    "entry_min_minutes_left": lambda v: max(0.0, float(v)),
+    "entry_max_spread": lambda v: max(0.0, float(v)),
+    "duo_defaults_v3": lambda v: str(v).lower() == "true",
+    "strat_a_mode": lambda v: "series" if str(v).lower() == "series" else "recover",
+    "coin_banks": lambda v: _parse_floats(v),
+    "duo_recover": lambda v: _parse_recover(v),
     "duo_a_remaining": _parse_counts,
 }
 
@@ -428,6 +486,12 @@ def compute_trade_size(asset: str | None = None, max_bank_age: float = 0.0) -> f
     иначе общую."""
     mode, trade_size_usdc, bankroll_pct = sizing(asset)
     if mode == "percent":
+        if asset and _state.get("strategies_mode"):
+            # Бот двух стратегий: у каждой монеты свой банк (src/duo.py);
+            # для оценки берём реальный, если бот в LIVE, иначе тестовый.
+            from src import duo   # здесь: duo импортирует runtime_state
+            bank = duo.coin_bank(asset, dry=bool(get("dry_run")), max_age=max(max_bank_age, 0.0))
+            return round(max(0.0, bank) * bankroll_pct / 100, 2)
         bankroll = max(0.0, current_bankroll(max_age=max_bank_age))
         return round(bankroll * bankroll_pct / 100, 2)
     return trade_size_usdc
@@ -577,6 +641,9 @@ def reset_asset(asset: str) -> None:
 
 STRAT_A_MAX_N = 50
 STRAT_B_PAUSE_PRESETS = (30, 60, 120)
+# Фильтры входа (🎯 → 🧹): 0 — выкл
+ENTRY_MIN_LEFT_PRESETS = (0.0, 1.5, 2.0, 2.5, 3.0)
+ENTRY_SPREAD_PRESETS = (0.0, 0.01, 0.02)
 
 
 def strat_a_count(asset: str) -> int:
@@ -593,3 +660,22 @@ def set_strat_a_count(asset: str, n: int) -> int:
     counts[asset.lower()] = n
     set("strat_a_counts", counts)
     return n
+
+
+# --- Свой банк у каждой монеты (бот двух стратегий) ---
+
+COIN_BANK_PRESETS = (25, 50, 75, 100, 200)
+
+
+def coin_bank_start(asset: str) -> float:
+    banks = _state.get("coin_banks") or {}
+    v = banks.get(asset.lower())
+    return float(v) if v is not None else max(0.0, float(settings.COIN_BANK_USDC))
+
+
+def set_coin_bank_start(asset: str, value: float) -> float:
+    value = round(max(0.0, float(value)), 2)
+    banks = dict(_state.get("coin_banks") or {})
+    banks[asset.lower()] = value
+    set("coin_banks", banks)
+    return value

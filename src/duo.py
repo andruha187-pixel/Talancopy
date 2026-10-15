@@ -8,19 +8,32 @@
 ВИРТУАЛЬНУЮ сделку (strategy='virt', dry_run=1) — по ним стратегии «читают»
 рынок:
 
-1️⃣ «После проигрыша» (A). После виртуального проигрыша монеты — N входов по
-   этой же монете (N своё у монеты, 🎯 Стратегии → 🔢). Проигрыш внутри серии
-   начинает её заново: серия кончается после N входов подряд без проигрыша.
-   N = 0 — по монете стратегия не входит.
-2️⃣ «Пауза после проигрыша» (B). Вход по монете, только если за последние
-   X минут (30/60/120, по умолчанию 60) у этой монеты не было виртуальных
-   проигрышей — каждая монета сама по себе. Можно переключить на общую паузу
-   (проигрыш любой монеты останавливает все): на истории 18.09–12.10 общая
-   была лучше, т.к. монеты разворачиваются вместе.
+1️⃣ Два режима (🎯 Стратегии → кнопка режима):
+   «🩹 Отыгрыш» (по умолчанию): 2️⃣ проиграла по монете — 1️⃣ один раз входит
+   по этой же монете на следующем сигнале на сумму, выигрыш с которой (за
+   вычетом комиссии) возвращает этот минус. Не больше банка монеты. Проиграл
+   отыгрыш — повтора нет. Вход реальный, только если и минус 2️⃣ реальный,
+   и 1️⃣ в «💵 реально»; иначе тестовый (тестовый минус реальными деньгами не
+   отыгрываем, реальный при 1️⃣ в тесте — отыгрываем тестовым входом).
+   «🔁 N после проигрыша»: после виртуального проигрыша монеты — N входов по
+   ней (N своё у монеты, 🔢); проигрыш внутри серии начинает её заново.
+2️⃣ «Пауза после проигрыша» (B). Вход, только если за последние X минут
+   (30/60/120, по умолчанию 60) не было виртуальных проигрышей ни по одной
+   монете — общая пауза (по умолчанию с 15.10: на архиве 18.09–12.10 и на
+   13–15.10 она была лучше, проигрыши идут пачками сразу по нескольким
+   монетам). Можно переключить на паузу у каждой монеты.
+
+🧹 Фильтры входа 1️⃣ и 2️⃣: не позже чем за N мин до конца (по умолчанию 2) и
+спред не шире X (по умолчанию выкл) — решение один раз на рынок, по первому
+сигналу; признаки входа пишутся в каждую сделку.
 
 У каждой стратегии свой режим: «🧪 тест» — её входы пишутся виртуально (со
 своей меткой), «💵 реально» — реальный ордер, если бот в LIVE и монета
-🔴 LIVE в 🪙 Активах. Ставка общая (💰 Размер позиции, своя у монеты в ⚙️).
+🔴 LIVE в 🪙 Активах. Ставка 2️⃣ (и 1️⃣ в режиме N) — фикс. или % банка
+(💰 / ⚙️ монеты); банк у каждой монеты свой: старт (🎯 → 🏦) + результат
+сделок стратегий этой монеты, реальные и тестовые — отдельно. Никакая
+ставка не больше банка монеты (банк кончился — входов по ней нет).
+Виртуальные сделки — всегда по $1.
 
 Результат рынка бот узнаёт сам в момент конца — по стакану: в последние
 секунды у стороны-победителя нет продавцов (или ask ≥ 0.97), а сторону-
@@ -35,6 +48,7 @@ import asyncio
 import logging
 import time
 
+from config import settings
 from src import book_stream, runtime_state, storage
 
 log = logging.getLogger("polymarket-bot")
@@ -42,6 +56,8 @@ log = logging.getLogger("polymarket-bot")
 VIRT, A, B = "virt", "A", "B"
 STRATS = (A, B)
 LABELS = {VIRT: "👻 Виртуальные", A: "1️⃣ После проигрыша", B: "2️⃣ Пауза после проигрыша"}
+VIRT_STAKE = 1.0           # виртуальные сделки — по $1: их PnL = итог на $1 ставки
+BANK_CACHE_SEC = 10.0
 SHORT = {VIRT: "👻", A: "1️⃣", B: "2️⃣"}
 _ENABLED_KEY = {A: "strat_a_enabled", B: "strat_b_enabled"}
 _LIVE_KEY = {A: "strat_a_live", B: "strat_b_live"}
@@ -106,6 +122,16 @@ def is_dry(strat: str, asset: str) -> bool:
     return not strategy_live(strat) or runtime_state.trade_is_dry(asset)
 
 
+def entry_dry(strat: str, asset: str) -> bool:
+    """Тестовым ли будет вход стратегии в этот раз. Отыгрыш 1️⃣ реальный, только
+    если 1️⃣ в «💵 реально» и ждёт отыгрыша реальный минус 2️⃣: тестовый минус
+    реальными деньгами не отыгрываем, а реальный при 1️⃣ в тесте отыгрываем
+    тестовым входом — видно, как сработал бы."""
+    if strat == A and a_mode() == "recover":
+        return is_dry(A, asset) or recover_amount(asset, False) <= 0
+    return is_dry(strat, asset)
+
+
 # ------------------------------------------------- стратегия 1️⃣ (A) ----
 
 def a_remaining(asset: str) -> int:
@@ -128,9 +154,113 @@ def _set_a_remaining(asset: str, n: int) -> None:
 
 
 def reset_a() -> None:
-    """Включили/выключили стратегию 1️⃣ — серии начинаются с чистого листа:
-    ждём следующего проигрыша, а не доигрываем старые."""
+    """Включили/выключили стратегию 1️⃣ или сменили её режим — с чистого
+    листа: ждём следующего проигрыша, а не доигрываем старые серии/отыгрыши."""
     runtime_state.set("duo_a_remaining", {})
+    runtime_state.set("duo_recover", {})
+
+
+def a_mode() -> str:
+    """Режим 1️⃣: "recover" — отыгрыш минуса 2️⃣, "series" — N после проигрыша."""
+    return "series" if runtime_state._state.get("strat_a_mode") == "series" else "recover"
+
+
+def label(strat: str) -> str:
+    if strat == A:
+        return "1️⃣ Отыгрыш минуса 2️⃣" if a_mode() == "recover" else "1️⃣ После проигрыша"
+    return LABELS[strat]
+
+
+# --------------------------------------------- отыгрыш минуса 2️⃣ (1️⃣) ----
+
+def recover_items(asset: str, dry: bool | None = None) -> list[dict]:
+    items = (runtime_state._state.get("duo_recover") or {}).get(asset.lower(), [])
+    return [it for it in items if dry is None or bool(it["dry"]) == bool(dry)]
+
+
+def recover_amount(asset: str, dry: bool | None) -> float:
+    """Сколько минуса 2️⃣ по монете ждёт отыгрыша: реального (dry=False),
+    тестового (True) или всего (None)."""
+    return round(sum(it["amount"] for it in recover_items(asset, dry)), 2)
+
+
+def recover_target(asset: str, dry: bool) -> float:
+    """Сколько отыгрывает вход 1️⃣: реальный — реальные минусы 2️⃣, тестовый —
+    все, что ждут (и реальные, если 1️⃣ в тесте)."""
+    return recover_amount(asset, None if dry else False)
+
+
+def _set_recover(asset: str, items: list[dict]) -> None:
+    cur = {a: list(v) for a, v in (runtime_state._state.get("duo_recover") or {}).items()}
+    if items:
+        cur[asset.lower()] = items
+    else:
+        cur.pop(asset.lower(), None)
+    runtime_state.set("duo_recover", cur)
+
+
+def _add_recover(asset: str, slug: str, amount: float, dry: bool) -> None:
+    items = recover_items(asset)
+    if any(it["slug"] == slug for it in items) or amount <= 0:
+        return
+    _set_recover(asset, items + [{"slug": slug, "amount": round(float(amount), 2), "dry": bool(dry)}])
+
+
+def _remove_recover_slug(asset: str, slug: str) -> None:
+    items = recover_items(asset)
+    left = [it for it in items if it["slug"] != slug]
+    if len(left) != len(items):
+        _set_recover(asset, left)
+
+
+def recovery_stake(target: float, price: float) -> float:
+    """Ставка, выигрыш с которой за вычетом комиссии (ставка × FEE_RATE ×
+    (1 − цена)) равен target. Пример: $5 по 0.92 → ≈$61.5."""
+    p = min(max(float(price), 0.01), 0.99)
+    per_dollar = (1 - p) * (1 / p - max(0.0, float(settings.FEE_RATE)))
+    if target <= 0 or per_dollar <= 0:
+        return 0.0
+    return round(target / per_dollar, 2)
+
+
+# ------------------------------------------------------- банки монет ----
+
+_bank_cache: dict[tuple[str, bool], tuple[float, float]] = {}
+
+
+def coin_bank(asset: str, dry: bool, max_age: float = BANK_CACHE_SEC) -> float:
+    """Банк монеты: старт (🎯 → 🏦) + итог закрытых сделок стратегий этой
+    монеты — реальных (dry=False) или тестовых (dry=True)."""
+    key = (asset.lower(), bool(dry))
+    now = time.monotonic()
+    c = _bank_cache.get(key)
+    if c is not None and max_age > 0 and now - c[0] <= max_age:
+        return c[1]
+    value = runtime_state.coin_bank_start(asset) + storage.coin_strategy_pnl(asset, dry)
+    _bank_cache[key] = (now, value)
+    return value
+
+
+def invalidate_banks() -> None:
+    _bank_cache.clear()
+
+
+def stake_for(strat: str, asset: str, dry: bool, price: float) -> float:
+    """Ставка входа: виртуальный — $1; 1️⃣ в режиме отыгрыша — сумма, которая
+    вернёт минус 2️⃣; иначе — фикс. или % банка монеты. Всегда не больше банка
+    монеты: банк кончился — 0, входа нет (пополнить — 🎯 → 🏦)."""
+    if strat == VIRT:
+        return VIRT_STAKE
+    bank = max(0.0, coin_bank(asset, dry))
+    if strat == A and a_mode() == "recover":
+        stake = recovery_stake(recover_target(asset, dry), price)
+    else:
+        mode, usdc, pct = runtime_state.sizing(asset)
+        stake = bank * pct / 100 if mode == "percent" else usdc
+    stake = round(max(0.0, min(stake, bank)), 2)
+    if 0 < stake < 1.0:   # меньше $1 Polymarket не примет
+        return 1.0 if bank >= 1.0 else 0.0
+    return stake
 
 
 # ------------------------------------------------- стратегия 2️⃣ (B) ----
@@ -140,9 +270,106 @@ def pause_sec() -> int:
 
 
 def scope() -> str:
-    """Пауза 2️⃣: "coin" — у каждой монеты своя (по умолчанию), "all" —
-    проигрыш любой монеты останавливает все."""
-    return "all" if runtime_state._state.get("strat_b_scope") == "all" else "coin"
+    """Пауза 2️⃣: "all" — проигрыш любой монеты останавливает все (по
+    умолчанию), "coin" — у каждой монеты своя."""
+    return "coin" if runtime_state._state.get("strat_b_scope") == "coin" else "all"
+
+
+# ------------------------------------------------------ фильтры входа ----
+#
+# Решают, пускать ли стратегии 1️⃣ и 2️⃣ в рынок, — один раз на рынок, в момент
+# первого сигнала (виртуальной сделки), как на истории, по которой их
+# выбирали. Виртуальные сделки пишутся всегда — по ним пауза и статистика.
+
+FILTER_LABELS = {"time": "мало времени до конца", "spread": "широкий спред"}
+REF_MIN_LEFT, REF_SPREAD = 2.0, 0.01   # пороги для сравнения в статистике, если фильтр выкл
+
+
+def entry_filters() -> tuple[float, float]:
+    """(минимум минут до конца, максимум спреда); 0 — фильтр выключен."""
+    return (max(0.0, float(runtime_state.get("entry_min_minutes_left") or 0.0)),
+            max(0.0, float(runtime_state.get("entry_max_spread") or 0.0)))
+
+
+def decision_spread(decision) -> float | None:
+    """Спред в момент сигнала: ask фаворита + ask другой стороны − 1."""
+    opp = getattr(decision, "opp_ask", None)
+    if opp is None or decision.entry_price is None:
+        return None
+    return round(decision.entry_price + opp - 1.0, 4)
+
+
+def entry_filter_reason(decision) -> str | None:
+    """"time" / "spread" — фильтры не пускают стратегии в рынок, None — пускают."""
+    min_left, max_spread = entry_filters()
+    if min_left > 0 and decision.minutes_left is not None and decision.minutes_left < min_left - 1e-9:
+        return "time"
+    if max_spread > 0:
+        sp = decision_spread(decision)
+        if sp is None or sp > max_spread + 1e-9:
+            return "spread"
+    return None
+
+
+def entry_features(decision, filtered: str | None = None) -> dict:
+    """Признаки входа для колонок сделки (storage.FEATURE_COLUMNS)."""
+    return {"minutes_left": decision.minutes_left, "opp_ask": getattr(decision, "opp_ask", None),
+            "spread": decision_spread(decision), "distance_pct": getattr(decision, "distance_pct", None),
+            "distance_atr": decision.distance_atr, "atr_ratio": getattr(decision, "atr_ratio", None),
+            "filtered": filtered or ""}
+
+
+def filters_text() -> str:
+    min_left, max_spread = entry_filters()
+    return ", ".join([f"до конца ≥ {min_left:g} мин" if min_left > 0 else "по времени — выкл",
+                      f"спред ≤ {max_spread * 100:g}¢" if max_spread > 0 else "по спреду — выкл"])
+
+
+def market_filtered(slug: str) -> str:
+    v = _virtual.get(slug)
+    return (v.get("filtered") or "") if v else ""
+
+
+def feature_split(since_ts: int = 0) -> list[tuple[str, dict]]:
+    """Виртуальные сделки, разбитые по признакам фильтров (пороги — текущие,
+    выключенный фильтр — опорный 2 мин / 1¢): [(название, итог)], итог —
+    {"trades", "losses", "expected_losses", "pnl_usdc"}."""
+    min_left, max_spread = entry_filters()
+    ml = min_left or REF_MIN_LEFT
+    sp = max_spread or REF_SPREAD
+    groups = {f"до конца ≥ {ml:g} мин": [], f"< {ml:g} мин": [],
+              f"спред ≤ {sp * 100:g}¢": [], f"спред > {sp * 100:g}¢": []}
+    keys = list(groups)
+    for price, direction, outcome, pnl, mleft, spread in storage.virtual_feature_rows(since_ts):
+        row = (price, direction, outcome, pnl)
+        if mleft is not None:
+            groups[keys[0] if mleft >= ml - 1e-9 else keys[1]].append(row)
+        if spread is not None:
+            groups[keys[2] if spread <= sp + 1e-9 else keys[3]].append(row)
+    out = []
+    for name in keys:
+        rows = groups[name]
+        out.append((name, {"trades": len(rows), "losses": sum(1 for r in rows if r[1] != r[2]),
+                           "expected_losses": sum(1.0 - float(r[0] or 0) for r in rows),
+                           "pnl_usdc": sum(float(r[3] or 0) for r in rows)}))
+    return out
+
+
+def apply_v3_defaults() -> bool:
+    """Разовый переход на настройки 15.10 (анализ архива 18.09–12.10 и сделок
+    13–15.10): общая пауза 2️⃣ 60 мин, фильтр «не позже чем за 2 мин до
+    конца», фильтр спреда выкл, обе стратегии в 🧪 тесте. Дальше настройки
+    меняются только кнопками. True — применили сейчас."""
+    if runtime_state.get("duo_defaults_v3"):
+        return False
+    runtime_state.set("strat_b_scope", "all")
+    runtime_state.set("strat_b_pause_min", 60)
+    runtime_state.set("entry_min_minutes_left", 2.0)
+    runtime_state.set("entry_max_spread", 0.0)
+    runtime_state.set("strat_a_live", False)
+    runtime_state.set("strat_b_live", False)
+    runtime_state.set("duo_defaults_v3", True)
+    return True
 
 
 def last_loss(asset: str | None = None) -> dict | None:
@@ -188,9 +415,15 @@ def paused_assets(now: float | None = None) -> dict[str, float]:
 
 def wanted(asset: str, slug: str, now: float | None = None) -> list[str]:
     """Какие стратегии хотят войти в этот рынок прямо сейчас."""
+    if market_filtered(slug):
+        return []          # фильтры входа закрыли рынок для стратегий
     out = []
-    if strategy_enabled(A) and a_remaining(asset) > 0 and (slug, A) not in _entered:
-        out.append(A)
+    if strategy_enabled(A) and (slug, A) not in _entered:
+        if a_mode() == "series":
+            if a_remaining(asset) > 0:
+                out.append(A)
+        elif recover_items(asset):
+            out.append(A)
     if strategy_enabled(B) and b_allowed(now, asset) and (slug, B) not in _entered:
         out.append(B)
     return out
@@ -211,22 +444,28 @@ def market_done(slug: str, now: float | None = None) -> bool:
 # ------------------------------------------------- события executor ----
 
 def on_virtual_logged(trade_id: int, slug: str, direction: str,
-                      up_token: str | None = None, down_token: str | None = None) -> None:
+                      up_token: str | None = None, down_token: str | None = None,
+                      filtered: str | None = None) -> None:
     b = _bounds(slug)
     if b is None:
         return
     _virtual[slug] = {"id": trade_id, "asset": _asset_of(slug), "direction": direction,
-                      "start": b[0], "end": b[1], "up": up_token, "down": down_token}
+                      "start": b[0], "end": b[1], "up": up_token, "down": down_token,
+                      "filtered": filtered or ""}
     if slug not in _applied:
         _pending.add(slug)
     _prune()
 
 
-def on_strategy_entered(strat: str, slug: str) -> None:
+def on_strategy_entered(strat: str, slug: str, dry: bool | None = None) -> None:
     _entered.add((slug, strat))
     if strat == A:
         asset = _asset_of(slug)
-        _set_a_remaining(asset, a_remaining(asset) - 1)
+        if a_mode() == "series":
+            _set_a_remaining(asset, a_remaining(asset) - 1)
+        elif recover_items(asset):
+            # отыгрыш — одна попытка: всё, что ждало, закрыто (проиграл — повтора нет)
+            _set_recover(asset, [])
 
 
 # ------------------------------------------------------ исходы рынков ----
@@ -262,16 +501,24 @@ def _apply(slug: str, direction: str, outcome: str) -> bool:
         return True
     asset = _asset_of(slug)
     if lost and not prev_lost:
-        # 1️⃣: серия по монете начинается — или начинается заново
         if strategy_enabled(A):
-            _set_a_remaining(asset, runtime_state.strat_a_count(asset))
+            if a_mode() == "series":
+                # 1️⃣: серия по монете начинается — или начинается заново
+                _set_a_remaining(asset, runtime_state.strat_a_count(asset))
+            else:
+                # 1️⃣: 2️⃣ проиграла в этом рынке — её минус ждёт отыгрыша
+                tr = storage.strategy_trade(slug, B)
+                if tr is not None:
+                    _add_recover(asset, slug, float(tr[1] or 0), bool(tr[2]))
         # 2️⃣: пауза монеты считается от конца проигравшего рынка
         cur = _losses.get(asset)
         if cur is None or b[1] >= cur["end"]:
             _losses[asset] = {"end": b[1], "slug": slug}
     elif prev_lost and not lost:
-        # Официальный исход поправил наш ранний «проигрыш» — паузы по базе
+        # Официальный исход поправил наш ранний «проигрыш» — паузы по базе,
+        # и отыгрывать нечего
         _recompute_losses()
+        _remove_recover_slug(asset, slug)
     return True
 
 
@@ -380,6 +627,9 @@ def init(now: float | None = None) -> None:
             _applied[slug] = res
         elif outcome is None:
             _pending.add(slug)
+    for slug, reason in storage.virtual_filtered_since(since).items():
+        if slug in _virtual:
+            _virtual[slug]["filtered"] = reason
     for slug, strat in storage.strategy_entries_since(since):
         _entered.add((slug, strat))
     _recompute_losses(now)
@@ -420,7 +670,20 @@ def mode_text(strat: str) -> str:
 
 
 def a_state_text(assets: list[str]) -> str:
-    """'SOL — осталось 2 из 3; BTC, ETH — ждут проигрыша; XRP — N=0'."""
+    """Режим отыгрыша: 'SOL — отыграть $5.00 (тест); BTC, ETH — ждут минуса 2️⃣'.
+    Режим N: 'SOL — осталось 2 из 3; BTC, ETH — ждут проигрыша; XRP — N=0'."""
+    if a_mode() == "recover":
+        todo, waiting = [], []
+        for a in assets:
+            if recover_items(a):
+                dry = entry_dry(A, a)
+                todo.append(f"{a.upper()} — отыграть ${recover_target(a, dry):.2f} "
+                            f"({'тест' if dry else 'реально'})")
+            else:
+                waiting.append(a.upper())
+        if waiting:
+            todo.append(f"{', '.join(waiting)} — {'ждёт' if len(waiting) == 1 else 'ждут'} минуса 2️⃣")
+        return "; ".join(todo) or "нет включённых монет"
     active, waiting, off = [], [], []
     for a in assets:
         n = runtime_state.strat_a_count(a)
@@ -466,7 +729,10 @@ def summary_line(now: float | None = None) -> str:
         else:
             paused = paused_assets(now)
             b += (", на паузе: " + ", ".join(a.upper() for a in sorted(paused))) if paused else ", можно входить"
-    return f"🎯 Стратегии: 1️⃣ {mode_text(A)} · 2️⃣ {b}"
+    a = mode_text(A)
+    if strategy_enabled(A):
+        a += ", отыгрыш" if a_mode() == "recover" else ", N после проигрыша"
+    return f"🎯 Стратегии: 1️⃣ {a} · 2️⃣ {b} · 🧹 {filters_text()}"
 
 
 def early_stats_text() -> str:
