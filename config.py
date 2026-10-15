@@ -196,17 +196,37 @@ class Settings:
     # ней (N своё у монеты: STRAT_A_COUNTS='{"sol": 8, "btc": 2}', остальным
     # STRAT_A_DEFAULT_N). Проигрыш внутри серии начинает её заново.
     STRAT_A_ENABLED: bool = _get_bool("STRAT_A_ENABLED", True)
+    # Режим стратегии 1️⃣: recover — «отыгрыш»: после проигрыша 2️⃣ по монете
+    # один вход по этой монете на сумму, выигрыш с которой (за вычетом
+    # комиссии) возвращает этот минус; series — N входов после виртуального
+    # проигрыша монеты (как было).
+    STRAT_A_MODE: str = os.getenv("STRAT_A_MODE", "recover").strip().lower()
     STRAT_A_LIVE: bool = _get_bool("STRAT_A_LIVE", False)
     STRAT_A_DEFAULT_N: int = _get_int("STRAT_A_DEFAULT_N", 2)
     STRAT_A_COUNTS: str = os.getenv("STRAT_A_COUNTS", "")
     # 2️⃣ «Пауза после проигрыша»: вход по монете, только если за последние
-    # STRAT_B_PAUSE_MIN минут у неё не было виртуальных проигрышей.
-    # STRAT_B_SCOPE: coin — у каждой монеты своя пауза (по умолчанию), all —
-    # проигрыш любой монеты останавливает все.
+    # STRAT_B_PAUSE_MIN минут не было виртуальных проигрышей.
+    # STRAT_B_SCOPE: all — проигрыш любой монеты останавливает все (по
+    # умолчанию: на архиве 18.09–12.10 и на 13–15.10 общая пауза была лучше),
+    # coin — у каждой монеты своя пауза.
     STRAT_B_ENABLED: bool = _get_bool("STRAT_B_ENABLED", True)
     STRAT_B_LIVE: bool = _get_bool("STRAT_B_LIVE", False)
     STRAT_B_PAUSE_MIN: int = _get_int("STRAT_B_PAUSE_MIN", 60)
-    STRAT_B_SCOPE: str = os.getenv("STRAT_B_SCOPE", "coin").strip().lower()
+    STRAT_B_SCOPE: str = os.getenv("STRAT_B_SCOPE", "all").strip().lower()
+    # Фильтры входа стратегий 1️⃣ и 2️⃣ (виртуальные сделки пишутся всегда):
+    # не входить, если до конца рынка меньше ENTRY_MIN_MINUTES_LEFT минут и
+    # если спред (ask фаворита + ask другой стороны − 1) шире ENTRY_MAX_SPREAD.
+    # 0 — фильтр выключен. Решение — один раз на рынок, в момент первого
+    # сигнала (виртуальной сделки). Пороги меняются в 🎯 → 🧹.
+    ENTRY_MIN_MINUTES_LEFT: float = _get_float("ENTRY_MIN_MINUTES_LEFT", 2.0)
+    ENTRY_MAX_SPREAD: float = _get_float("ENTRY_MAX_SPREAD", 0.0)
+    # Свой банк у каждой монеты (для ставки «% банка» и как потолок отыгрыша):
+    # стартовая сумма, дальше банк = старт + результат сделок стратегий этой
+    # монеты (реальные и тестовые — отдельно). Своя сумма у монеты — 🎯 → 🏦.
+    COIN_BANK_USDC: float = _get_float("COIN_BANK_USDC", 75.0)
+    # Комиссия тейкера Polymarket: ставка × FEE_RATE × (1 − цена). Нужна, чтобы
+    # отыгрыш возвращал минус уже после комиссии.
+    FEE_RATE: float = _get_float("FEE_RATE", 0.07)
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
