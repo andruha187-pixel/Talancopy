@@ -228,6 +228,18 @@ class Settings:
     # отыгрыш возвращал минус уже после комиссии.
     FEE_RATE: float = _get_float("FEE_RATE", 0.07)
 
+    # --- ⚡ Лаборатория скорости (src/speed_lab.py) ---
+    # Только запись, ничего не покупает: при рывке цены на Binance (честная
+    # вероятность UP сдвинулась на ≥ SPEED_LAB_JUMP за ≤ SPEED_LAB_WINDOW_MS)
+    # пишет стакан обеих сторон рынка за 2 с до и SPEED_LAB_RECORD_MS после —
+    # чтобы узнать, сколько миллисекунд Polymarket держит старую цену.
+    SPEED_LAB_ENABLED: bool = _get_bool("SPEED_LAB_ENABLED", True)
+    SPEED_LAB_JUMP: float = _get_float("SPEED_LAB_JUMP", 0.05)
+    SPEED_LAB_WINDOW_MS: int = _get_int("SPEED_LAB_WINDOW_MS", 1000)
+    SPEED_LAB_RECORD_MS: int = _get_int("SPEED_LAB_RECORD_MS", 6000)
+    SPEED_LAB_COOLDOWN_MS: int = _get_int("SPEED_LAB_COOLDOWN_MS", 3000)
+    SPEED_LAB_KEEP_DAYS: float = _get_float("SPEED_LAB_KEEP_DAYS", 3.0)
+
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
