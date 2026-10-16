@@ -24,7 +24,7 @@ from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
 from src.market_discovery import ActiveMarket
 from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot
-from src import price_stream, fast_signal, entry_confirm, chainlink_feed, duo
+from src import price_stream, fast_signal, entry_confirm, chainlink_feed, duo, speed_lab, venues
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -312,6 +312,9 @@ async def main():
             fast_note += ("\n" + duo.summary_line() + "\nКаждый сигнал — виртуальная сделка, реальные "
                           "входы делают стратегии (🎯 Стратегии в меню). 🔴 у монеты — стратегиям можно "
                           "входить по ней реальными деньгами, 🧪 — только тест.")
+            if speed_lab.enabled() and settings.USE_LIVE_BOOK_STREAM:
+                fast_note += ("\n⚡ Скорость рынка: запись идёт — рывки Binance, стакан Polymarket до/после "
+                              "и цены других бирж (ничего не покупает; 🎯 Стратегии → ⚡).")
             if duo_v3_applied:
                 fast_note += ("\n🆕 Настройки обновлены: пауза 2️⃣ — общая, 60 мин; фильтр входа — не позже "
                               "чем за 2 мин до конца (спред — выкл, только пишется); обе стратегии в 🧪 тесте. "
@@ -337,6 +340,12 @@ async def main():
         duo_task = asyncio.create_task(duo.run_forever())
         fast_task = (asyncio.create_task(fast_signal.run_forever(_active_markets))
                      if settings.USE_LIVE_BOOK_STREAM else None)
+        # ⚡ Лаборатория скорости: только запись — рывки Binance и стакан до/после
+        speed_task = (asyncio.create_task(speed_lab.run_forever(_active_markets))
+                      if settings.USE_LIVE_BOOK_STREAM else None)
+        # Другие биржи для лаборатории (только чтение; молчат, пока запись выключена)
+        venues_task = (asyncio.create_task(venues.run_forever(active=speed_lab.enabled))
+                       if settings.USE_LIVE_BOOK_STREAM and venues.enabled_venues() else None)
 
         report_task = asyncio.create_task(reporting.report_loop())
         settlement_task = asyncio.create_task(settlement_loop())
@@ -359,6 +368,10 @@ async def main():
             duo_task.cancel()
             if fast_task:
                 fast_task.cancel()
+            if speed_task:
+                speed_task.cancel()
+            if venues_task:
+                venues_task.cancel()
             report_task.cancel()
             settlement_task.cancel()
             stop_loss_task.cancel()

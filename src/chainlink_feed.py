@@ -79,6 +79,19 @@ _last_rx: dict[str, float] = {}      # монета -> наше время по�
 _source: dict[str, str] = {}         # монета -> поставщик цены (chainlink, …)
 _strikes: dict[str, float] = {}      # слаг рынка -> страйк Chainlink
 _transports: dict[str, Transport] = {"polybolt": Transport("polybolt"), "rtds": Transport("rtds")}
+# Кому ещё отдавать точки цены: fn(монета, время оракула с, цена, наше время с).
+# Сейчас — ⚡ лаборатории скорости (src/speed_lab.py).
+_listeners: list = []
+
+
+def add_listener(fn) -> None:
+    if fn not in _listeners:
+        _listeners.append(fn)
+
+
+def remove_listener(fn) -> None:
+    if fn in _listeners:
+        _listeners.remove(fn)
 
 
 def reset() -> None:
@@ -252,6 +265,11 @@ def _store(points, transport: Transport) -> int:
     for asset, ts, val, src in points:
         add_point(asset, ts, val, src, rx=rx)
         transport.symbols.add(asset)
+        for fn in _listeners:
+            try:
+                fn(asset, ts, val, rx)
+            except Exception as exc:  # noqa: BLE001 — слушатель не должен ронять поток
+                log.debug("Слушатель Chainlink упал: %s", exc)
     if points:
         transport.last_data = rx
         transport.points += len(points)

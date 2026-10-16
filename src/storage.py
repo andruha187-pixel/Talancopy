@@ -98,7 +98,111 @@ CREATE TABLE IF NOT EXISTS hedge_positions (
     pnl_usdc REAL,
     dry_run INTEGER
 );
+
+-- ⚡ Лаборатория скорости (src/speed_lab.py): одна строка — один рывок цены
+-- на Binance и что в это время делал стакан Polymarket. Пути (book_path,
+-- binance_path, depth0) — JSON, время в мс от рывка.
+CREATE TABLE IF NOT EXISTS speed_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    t0_ms INTEGER,
+    asset TEXT,
+    market_slug TEXT,
+    sec_left REAL,
+    direction TEXT,
+    p0 REAL,
+    p1 REAL,
+    jump_ms INTEGER,
+    price0 REAL,
+    price1 REAL,
+    strike REAL,
+    sigma_1s REAL,
+    fav_bid0 REAL,
+    fav_ask0 REAL,
+    fav_ask_size0 REAL,
+    book_age_ms INTEGER,
+    pre_move REAL,
+    reprice_ms INTEGER,
+    mid_reprice_ms INTEGER,
+    mid_end REAL,
+    bid_end REAL,
+    move REAL,
+    ask_0 REAL,
+    ask_100 REAL,
+    ask_250 REAL,
+    ask_500 REAL,
+    ask_1000 REAL,
+    ask_2000 REAL,
+    edge_0 REAL,
+    edge_100 REAL,
+    edge_250 REAL,
+    edge_500 REAL,
+    edge_1000 REAL,
+    edge_2000 REAL,
+    bn_delay_ms REAL,
+    pm_delay_ms REAL,
+    rtt_ms REAL,
+    outcome TEXT,
+    depth0 TEXT,
+    book_path TEXT,
+    binance_path TEXT,
+    venue_x TEXT,
+    venue_paths TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_speed_events_ts ON speed_events(ts);
+CREATE INDEX IF NOT EXISTS idx_speed_events_slug ON speed_events(market_slug);
 """
+
+SPEED_COLUMNS = [
+    "id", "ts", "t0_ms", "asset", "market_slug", "sec_left", "direction", "p0", "p1", "jump_ms",
+    "price0", "price1", "strike", "sigma_1s", "fav_bid0", "fav_ask0", "fav_ask_size0", "book_age_ms",
+    "pre_move", "reprice_ms", "mid_reprice_ms", "mid_end", "bid_end", "move",
+    "ask_0", "ask_100", "ask_250", "ask_500", "ask_1000", "ask_2000",
+    "edge_0", "edge_100", "edge_250", "edge_500", "edge_1000", "edge_2000",
+    "bn_delay_ms", "pm_delay_ms", "rtt_ms", "outcome", "depth0", "book_path", "binance_path",
+    "venue_x", "venue_paths",
+]
+# Колонки speed_events, добавленные после первой версии лаборатории (16.10)
+_SPEED_MIGRATIONS = [("venue_x", "TEXT"), ("venue_paths", "TEXT")]
+
+
+def save_speed_events(rows: list[dict]) -> int:
+    """Записать события лаборатории скорости (словари с колонками SPEED_COLUMNS
+    без id) одной транзакцией."""
+    if not rows:
+        return 0
+    cols = [c for c in SPEED_COLUMNS if c != "id"]
+    sql = f"INSERT INTO speed_events ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
+    with _conn() as conn:
+        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
+    return len(rows)
+
+
+def get_speed_events_since(since_ts: int) -> list[tuple]:
+    """Строки для CSV (все колонки SPEED_COLUMNS)."""
+    with _conn() as conn:
+        cur = conn.execute(f"SELECT {', '.join(SPEED_COLUMNS)} FROM speed_events WHERE ts >= ? ORDER BY ts ASC, id ASC",
+                           (since_ts,))
+        return cur.fetchall()
+
+
+_SPEED_SUMMARY_COLS = ("asset", "direction", "p0", "p1", "fav_ask0", "pre_move", "reprice_ms", "mid_reprice_ms",
+                       "ask_0", "ask_100", "ask_250", "ask_500", "ask_1000", "ask_2000",
+                       "edge_0", "edge_100", "edge_250", "edge_500", "edge_1000", "edge_2000", "outcome",
+                       "venue_x")
+
+
+def speed_rows_since(since_ts: int) -> list[dict]:
+    """События для сводки — без тяжёлых JSON-колонок."""
+    with _conn() as conn:
+        cur = conn.execute(f"SELECT {', '.join(_SPEED_SUMMARY_COLS)} FROM speed_events WHERE ts >= ?", (since_ts,))
+        return [dict(zip(_SPEED_SUMMARY_COLS, row)) for row in cur.fetchall()]
+
+
+def cleanup_speed(before_ts: int) -> int:
+    with _conn() as conn:
+        return conn.execute("DELETE FROM speed_events WHERE ts < ?", (before_ts,)).rowcount
+
 
 HEDGE_COLUMNS = [
     "id", "ts", "market_slug", "asset", "timeframe", "side", "entry_price", "entry_shares",
@@ -268,6 +372,10 @@ def init_db():
         for col, sql_type in _TRADES_MIGRATIONS:
             if col not in existing_trades:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {sql_type}")
+        existing_speed = {row[1] for row in conn.execute("PRAGMA table_info(speed_events)")}
+        for col, sql_type in _SPEED_MIGRATIONS:
+            if col not in existing_speed:
+                conn.execute(f"ALTER TABLE speed_events ADD COLUMN {col} {sql_type}")
 
 
 def log_signal(market_slug: str, current_price: float, strike_price: float, decision,
@@ -322,6 +430,9 @@ def label_signals_outcome(market_slug: str, outcome: str) -> int:
             "UPDATE signals SET outcome = ? WHERE market_slug = ? AND outcome IS NULL",
             (outcome, market_slug),
         )
+        # Рывки ⚡ лаборатории скорости на этом рынке — тем же исходом
+        conn.execute("UPDATE speed_events SET outcome = ? WHERE market_slug = ? AND outcome IS NULL",
+                     (outcome, market_slug))
         return cur.rowcount
 
 

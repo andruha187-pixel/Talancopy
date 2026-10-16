@@ -83,6 +83,20 @@ _venue_of: dict[str, str] = {}
 _conns: dict[str, Connection] = {v: Connection(v) for v in VENUES}
 _wake: dict[str, asyncio.Event] = {}
 _ids = itertools.count(1)
+# Кому ещё отдавать каждую сделку: fn(symbol, price, trade_ms, recv_ms).
+# Сейчас — ⚡ лаборатории скорости (src/speed_lab.py). Ошибка слушателя не
+# мешает потоку цены.
+_listeners: list = []
+
+
+def add_listener(fn) -> None:
+    if fn not in _listeners:
+        _listeners.append(fn)
+
+
+def remove_listener(fn) -> None:
+    if fn in _listeners:
+        _listeners.remove(fn)
 
 
 def reset() -> None:
@@ -150,6 +164,11 @@ def on_trade(symbol: str, price: float, trade_ms: int, recv_ms: int | None = Non
         # Запоздавшая сделка прошлой минуты — только максимум/минимум
         m, o, h, low, c = t.prev
         t.prev = (m, o, max(h, price), min(low, price), c)
+    for fn in _listeners:
+        try:
+            fn(symbol, price, trade_ms, recv_ms)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Слушатель сделок упал: %s", exc)
 
 
 def latest(symbol: str, now: int | None = None) -> Ticker | None:
@@ -172,9 +191,11 @@ def latest(symbol: str, now: int | None = None) -> Ticker | None:
     return None
 
 
-def handle_raw(conn: Connection, raw) -> int:
+def handle_raw(conn: Connection, raw, recv_ms: int | None = None) -> int:
     """Разбор одного сообщения потока. Возвращает 1, если учли сделку.
-    Ответы на SUBSCRIBE ({"result": null, "id": 1}) и мусор пропускаем."""
+    Ответы на SUBSCRIBE ({"result": null, "id": 1}) и мусор пропускаем.
+    recv_ms — когда сообщение пришло (наши часы)."""
+    recv_ms = now_ms() if recv_ms is None else recv_ms
     try:
         msg = json.loads(raw)
     except (TypeError, ValueError):
@@ -194,7 +215,7 @@ def handle_raw(conn: Connection, raw) -> int:
         return 0
     if price <= 0:
         return 0
-    on_trade(symbol, price, trade_ms, gen=conn.gen)
+    on_trade(symbol, price, trade_ms, recv_ms=recv_ms, gen=conn.gen)
     return 1
 
 
@@ -242,7 +263,7 @@ async def _pump(ws, conn: Connection) -> None:
     try:
         async for raw in ws:
             conn.last_msg_ms = now_ms()
-            handle_raw(conn, raw)
+            handle_raw(conn, raw, conn.last_msg_ms)
             if conn.wanted - conn.subscribed:
                 await _subscribe_missing(ws, conn)
     finally:

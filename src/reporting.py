@@ -17,13 +17,19 @@
 from __future__ import annotations
 import asyncio
 import csv
+import logging
 import os
 import time
+import zipfile
 
 from config import settings
 from src import storage, telegram_notify, loss_stats, diagnostics, runtime_state
 
+log = logging.getLogger("reporting")
+
 _LAST_REPORT_KEY = "last_report_ts"
+# CSV ⚡ лаборатории скорости больше этого — шлём zip (лимит файла у бота 50 МБ)
+SPEED_ZIP_OVER_BYTES = 15 * 1024 * 1024
 
 # Сделка, открытая в последние минуты окна, резолвится уже после отчёта — и
 # раньше её исход не попадал ни в один CSV (так «пропал» проигрыш 03.10 04:42).
@@ -228,7 +234,48 @@ async def build_and_send_report() -> None:
         )
         await telegram_notify.send_document(hedge_path, hedge_caption)
 
+    try:
+        await _send_speed(base, from_label, to_label, since_ts, max(0, since_ts - TRADES_OVERLAP_SEC))
+    except Exception as exc:  # noqa: BLE001 — лаборатория не должна ломать отчёт
+        log.warning("Отчёт ⚡ скорости не ушёл: %s", exc)
+
     _set_last_report_ts(now_ts)
+
+
+async def _send_speed(base: str, from_label: str, to_label: str, since_ts: int, rows_since: int) -> int:
+    """⚡ Лаборатория скорости: события с rows_since отдельным файлом (в отчёте
+    — период и 15 мин прошлого, уже с исходом рынка; повторы отличаются по id),
+    сводка в подписи — с since_ts. После отправки файл удаляем — события и так
+    лежат в базе SPEED_LAB_KEEP_DAYS дней. Возвращает число событий."""
+    from src import speed_lab
+    rows = storage.get_speed_events_since(rows_since)
+    if not rows:
+        return 0
+    path = f"{base}_speed.csv"
+    _write_csv(path, storage.SPEED_COLUMNS, rows)
+    send_path = path
+    if os.path.getsize(path) > SPEED_ZIP_OVER_BYTES:
+        send_path = path + ".zip"
+        with zipfile.ZipFile(send_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(path, arcname=os.path.basename(path))
+    try:
+        await telegram_notify.send_document(send_path, _fit_caption(speed_lab.report_caption(from_label, to_label,
+                                                                                               since_ts)))
+    finally:
+        for p in {path, send_path}:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return len(rows)
+
+
+async def send_speed_all() -> int:
+    """Кнопка «📤» в ⚡: все события из базы одним файлом."""
+    now_ts = int(time.time())
+    to_label = time.strftime("%Y%m%d-%H%M", time.gmtime(now_ts))
+    base = os.path.join(settings.REPORTS_DIR, f"all_to_{to_label}")
+    return await _send_speed(base, "всё в базе", to_label, 0, 0)
 
 
 async def report_loop() -> None:

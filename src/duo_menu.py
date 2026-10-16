@@ -10,7 +10,7 @@ import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import settings
-from src import duo, loss_stats, runtime_state, storage
+from src import duo, loss_stats, runtime_state, speed_lab, storage
 
 N_PRESETS = (0, 1, 2, 3, 4, 5, 6, 8)
 
@@ -152,6 +152,8 @@ def menu_markup() -> InlineKeyboardMarkup:
     ])
     rows.append([InlineKeyboardButton("🧹 Фильтры входа", callback_data="duo:flt"),
                  InlineKeyboardButton("🏦 Банки монет", callback_data="duo:banks")])
+    rows.append([InlineKeyboardButton("⚡ Скорость рынка", callback_data="duo:spd")])
+    rows.append([InlineKeyboardButton("📚 Серии UP/DOWN: история за год", callback_data="duo:hist")])
     rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="duo:menu")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
@@ -193,6 +195,16 @@ def filters_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([t_row[:3], t_row[3:], s_row,
                                  [InlineKeyboardButton("🔄 Обновить", callback_data="duo:flt")],
                                  [InlineKeyboardButton("◀️ Назад", callback_data="duo:menu")]])
+
+
+def speed_markup() -> InlineKeyboardMarkup:
+    on = speed_lab.enabled()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏸ Выключить запись" if on else "▶️ Включить запись", callback_data="duo:spdt")],
+        [InlineKeyboardButton("📤 Файл: все рывки в базе", callback_data="duo:spdx")],
+        [InlineKeyboardButton("🔄 Обновить", callback_data="duo:spd")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="duo:menu")],
+    ])
 
 
 def banks_text() -> str:
@@ -302,6 +314,11 @@ def handle(data: str):
         return banks_text(), banks_markup(), None
     if cmd == "flt":
         return filters_text(), filters_markup(), None
+    if cmd == "spd":
+        return speed_lab.menu_text(), speed_markup(), None
+    if cmd == "spdt":
+        speed_lab.set_enabled(not speed_lab.enabled())
+        return speed_lab.menu_text(), speed_markup(), None
     if cmd in ("fm", "fs") and len(parts) == 3:
         try:
             value = float(parts[2])

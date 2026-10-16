@@ -221,6 +221,8 @@ _DEFAULTS = {
     "duo_recover": {},
     # Состояние стратегии 1️⃣: сколько входов осталось в текущей серии по монете
     "duo_a_remaining": {},
+    # ⚡ Лаборатория скорости: запись рывков Binance и стакана (src/speed_lab.py)
+    "speed_lab_enabled": settings.SPEED_LAB_ENABLED,
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -273,6 +275,7 @@ _CASTERS = {
     "coin_banks": lambda v: _parse_floats(v),
     "duo_recover": lambda v: _parse_recover(v),
     "duo_a_remaining": _parse_counts,
+    "speed_lab_enabled": lambda v: str(v).lower() == "true",
 }
 
 _state: dict = dict(_DEFAULTS)

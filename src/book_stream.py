@@ -45,6 +45,31 @@ _subscribed_at: dict[str, int] = {}
 _last_forced_reconnect_ms = 0
 WATCHDOG_NO_DATA_MS = 8000        # подписаны столько, а стакана так и нет — переподключаемся
 WATCHDOG_MIN_INTERVAL_MS = 30000  # не чаще раза в 30 с
+# Кому сообщать об изменении стакана токена: fn(asset_id, recv_ms, server_ms).
+# server_ms — поле timestamp сообщения Polymarket (их часы), может быть None.
+# Сейчас — ⚡ лаборатории скорости (src/speed_lab.py).
+_listeners: list = []
+
+
+def add_listener(fn) -> None:
+    if fn not in _listeners:
+        _listeners.append(fn)
+
+
+def remove_listener(fn) -> None:
+    if fn in _listeners:
+        _listeners.remove(fn)
+
+
+def _server_ms(msg: dict) -> int | None:
+    raw = msg.get("timestamp")
+    try:
+        ts = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    return ts * 1000 if ts < 10**12 else ts
 
 
 def now_ms() -> int:
@@ -74,11 +99,15 @@ def _apply_snapshot(asset: str, msg: dict) -> None:
     }
 
 
-def _apply_delta(msg: dict) -> None:
+def _apply_delta(msg: dict) -> list[str]:
+    """Применить изменения уровней. Возвращает токены, которых они коснулись."""
+    touched: list[str] = []
     for ch in msg.get("price_changes", []):
         asset = str(ch.get("asset_id") or "")
         if not asset:
             continue
+        if asset not in touched:
+            touched.append(asset)
         book = _books.setdefault(asset, {"bids": {}, "asks": {}, "received_ms": now_ms(), "tick_size": 0.01})
         try:
             price = float(ch.get("price"))
@@ -92,6 +121,7 @@ def _apply_delta(msg: dict) -> None:
         else:
             target[price] = size
         book["received_ms"] = now_ms()
+    return touched
 
 
 def subscribe(asset_ids: list[str]) -> None:
@@ -226,21 +256,33 @@ async def _watchdog(ws) -> None:
             return
 
 
-def _handle_message(msg: dict) -> None:
+def _handle_message(msg: dict, recv_ms: int | None = None) -> None:
     """Обработка ОДНОГО объекта сообщения. Вызывается и напрямую (обычный
-    dict), и поэлементно, если сервер прислал JSON-массив (см. ниже)."""
+    dict), и поэлементно, если сервер прислал JSON-массив (см. ниже).
+    recv_ms — когда сообщение пришло (наши часы)."""
     event_type = msg.get("event_type")
+    touched: list[str] = []
     if event_type == "book":
         asset = str(msg.get("asset_id") or "")
         if asset:
             _apply_snapshot(asset, msg)
+            touched = [asset]
     elif event_type == "price_change":
-        _apply_delta(msg)
+        touched = _apply_delta(msg)
     elif event_type == "tick_size_change":
         asset = str(msg.get("asset_id") or "")
         new_tick = msg.get("new_tick_size")
         if asset in _books and new_tick:
             _books[asset]["tick_size"] = float(new_tick)
+    if touched and _listeners:
+        recv = now_ms() if recv_ms is None else recv_ms
+        server = _server_ms(msg)
+        for asset in touched:
+            for fn in _listeners:
+                try:
+                    fn(asset, recv, server)
+                except Exception as exc:  # noqa: BLE001 — слушатель не должен ронять поток
+                    log.debug("Слушатель стакана упал: %s", exc)
 
 
 async def run_forever() -> None:
@@ -269,6 +311,7 @@ async def run_forever() -> None:
                     async for raw in ws:
                         if not raw or raw == "PONG":
                             continue
+                        recv_ms = now_ms()
                         try:
                             parsed = json.loads(raw)
                         except (json.JSONDecodeError, ValueError) as exc:
@@ -286,7 +329,7 @@ async def run_forever() -> None:
                         messages = parsed if isinstance(parsed, list) else [parsed]
                         for msg in messages:
                             if isinstance(msg, dict):
-                                _handle_message(msg)
+                                _handle_message(msg, recv_ms)
                 finally:
                     sender_task.cancel()
                     watchdog_task.cancel()

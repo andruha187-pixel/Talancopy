@@ -1231,6 +1231,29 @@ async def _on_callback_inner(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if await _handle_asset_cfg(query, data):
         return
 
+    if data == "duo:hist":
+        # 🎯 → 📚: серии UP/DOWN по свечам Binance — считается в фоне, итог придёт сообщением
+        from src import duo_menu, history_study
+        if history_study.start():
+            head = (f"📚 Запустил: беру свечи Binance за {settings.SERIES_HISTORY_DAYS} дн. (5m и 15m, "
+                    f"{', '.join(a.upper() for a in settings.ASSETS)}) и считаю серии и удвоения. "
+                    "Минут 5 — пришлю итог и файл. Бот в это время работает как обычно.")
+        else:
+            head = history_study.status_text() or "📚 Расчёт уже идёт."
+        await _safe_edit(query, head + "\n\n" + duo_menu.menu_text(), duo_menu.menu_markup())
+        return
+
+    if data == "duo:spdx":
+        # ⚡ Скорость рынка → 📤: файл со всеми рывками из базы
+        from src import duo_menu, reporting, speed_lab
+        try:
+            n = await reporting.send_speed_all()
+            head = f"📤 Отправил файл: рывков {n}." if n else "📤 Рывков в базе пока нет — нечего выгружать."
+        except Exception as exc:  # noqa: BLE001
+            head = f"⚠️ Файл не ушёл: {exc}"[:300]
+        await _safe_edit(query, head + "\n\n" + speed_lab.menu_text(), duo_menu.speed_markup())
+        return
+
     if data.startswith("duo:"):
         from src import duo_menu
         res = duo_menu.handle(data)
