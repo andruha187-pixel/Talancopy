@@ -239,6 +239,16 @@ class Settings:
     SPEED_LAB_RECORD_MS: int = _get_int("SPEED_LAB_RECORD_MS", 6000)
     SPEED_LAB_COOLDOWN_MS: int = _get_int("SPEED_LAB_COOLDOWN_MS", 3000)
     SPEED_LAB_KEEP_DAYS: float = _get_float("SPEED_LAB_KEEP_DAYS", 3.0)
+    # Другие биржи для сравнения (src/venues.py, публичные потоки сделок без
+    # ключей): bnf — фьючерсы Binance, cb — Coinbase, okx — OKX, byb — Bybit.
+    # Пусто — только Binance спот и Chainlink.
+    SPEED_LAB_VENUES: str = os.getenv("SPEED_LAB_VENUES", "bnf,cb,okx,byb")
+
+    # --- 📚 Серии UP/DOWN (src/history_study.py, кнопка в 🎯 Стратегиях) ---
+    # За сколько дней брать свечи Binance и по какому ask считать ставку на
+    # разворот (по архиву на старте окна ask в среднем 0.515).
+    SERIES_HISTORY_DAYS: int = _get_int("SERIES_HISTORY_DAYS", 365)
+    SERIES_ENTRY_PRICE: float = _get_float("SERIES_ENTRY_PRICE", 0.51)
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
