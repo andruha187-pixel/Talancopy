@@ -1,6 +1,6 @@
 services:
   - type: worker
-    name: polymarket-5m-bot
+    name: polymarket-5m-late-bot
     env: python
     plan: starter
     buildCommand: "pip install -r requirements.txt"
