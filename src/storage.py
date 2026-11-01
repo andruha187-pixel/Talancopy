@@ -1,11 +1,6 @@
 """
-Лёгкое SQLite-хранилище: сигналы (для последующего бэктеста стратегии) и
-сделки (для учёта PnL). Никакой внешней БД не нужно для старта.
-
-Таблица signals пишет КАЖДЫЙ тик, вошёл бот или нет — это основной
-датасет для анализа: раз в 15 минут рынок резолвится, и мы можем
-подписать (label_signals_outcome) все тики этого рынка исходом,
-получая полноценные признаки + метку для последующего подбора формулы.
+SQLite-хранилище: окна 5m-рынков с путём цены (late_windows), ставки (late_trades)
+и настройки из Telegram (bot_settings). Внешней БД не нужно.
 """
 from __future__ import annotations
 import os
@@ -16,330 +11,61 @@ from contextlib import contextmanager
 from config import settings
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS signals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    market_slug TEXT NOT NULL,
-    current_price REAL,
-    strike_price REAL,
-    direction TEXT,
-    entry_price REAL,
-    safety_score REAL,
-    minutes_left REAL,
-    distance_atr REAL,
-    should_enter INTEGER,
-    reasons TEXT
-);
-
-CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    market_slug TEXT NOT NULL,
-    condition_id TEXT,
-    direction TEXT,
-    entry_price REAL,
-    size_usdc REAL,
-    order_id TEXT,
-    status TEXT,
-    outcome TEXT,
-    pnl_usdc REAL,
-    dry_run INTEGER
-);
-
 CREATE TABLE IF NOT EXISTS bot_settings (
     key TEXT PRIMARY KEY,
     value TEXT
 );
 
-CREATE TABLE IF NOT EXISTS momentum_checkpoints (
+-- 🔁 Окно 5m-рынка (по всем монетам, даже выключенным): страйк (цена Chainlink на
+-- старте), путь [[секунд до конца, ask UP, ask DOWN, цена Chainlink, ATR], …] и исход:
+-- ранний (стакан в последние секунды / Chainlink) и официальный.
+CREATE TABLE IF NOT EXISTS late_windows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    market_slug TEXT NOT NULL,
-    asset TEXT,
-    timeframe TEXT,
-    side TEXT,
-    checkpoint_price REAL,
-    minutes_left REAL,
-    rsi REAL,
-    macd_histogram REAL,
-    macd_bullish INTEGER,
-    atr REAL,
-    atr_ratio_to_avg REAL,
-    ema_fast REAL,
-    ema_slow REAL,
-    ema_fast_slope REAL,
-    trend_up INTEGER,
-    bb_width REAL,
-    bb_percent_b REAL,
-    volume_ratio REAL,
-    book_imbalance REAL,
-    final_outcome TEXT,
-    side_won INTEGER
+    asset TEXT NOT NULL,
+    start_ts INTEGER NOT NULL,
+    slug TEXT,
+    strike REAL,
+    path TEXT,
+    cl_end REAL,
+    early_outcome TEXT,
+    outcome TEXT,
+    UNIQUE(asset, start_ts)
 );
+CREATE INDEX IF NOT EXISTS idx_late_windows_start ON late_windows(start_ts);
 
-CREATE TABLE IF NOT EXISTS hedge_positions (
+-- ⏱ Ставки: тестовые (dry_run=1) и реальные (dry_run=0) — по одной на окно. Реальная, которая так и
+-- не исполнилась за окно входа, — строка со status SKIP_NOFILL и причиной в note (в итоги не идёт).
+CREATE TABLE IF NOT EXISTS late_trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER NOT NULL,
-    market_slug TEXT NOT NULL,
     asset TEXT,
-    timeframe TEXT,
+    start_ts INTEGER,
+    slug TEXT,
     side TEXT,
-    entry_price REAL,
-    entry_shares REAL,
-    entry_cost REAL,
-    entry_token_id TEXT,
-    hedge_price REAL,
-    hedge_shares REAL,
-    hedge_cost REAL,
-    hedge_token_id TEXT,
-    hedge_ts INTEGER,
+    token_id TEXT,
+    t_left REAL,
+    price_now REAL,
+    strike REAL,
+    dist_pct REAL,
+    dist_atr REAL,
+    atr REAL,
+    ask REAL,
+    price REAL,
+    size_usdc REAL,
+    shares REAL,
+    fee_usdc REAL,
+    dry_run INTEGER,
     status TEXT,
+    order_id TEXT,
     outcome TEXT,
     pnl_usdc REAL,
-    dry_run INTEGER
+    settled_ts INTEGER,
+    rule TEXT,
+    note TEXT,
+    UNIQUE(asset, start_ts, dry_run)
 );
-
--- ⚡ Лаборатория скорости (src/speed_lab.py): одна строка — один рывок цены
--- на Binance и что в это время делал стакан Polymarket. Пути (book_path,
--- binance_path, depth0) — JSON, время в мс от рывка.
-CREATE TABLE IF NOT EXISTS speed_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    t0_ms INTEGER,
-    asset TEXT,
-    market_slug TEXT,
-    sec_left REAL,
-    direction TEXT,
-    p0 REAL,
-    p1 REAL,
-    jump_ms INTEGER,
-    price0 REAL,
-    price1 REAL,
-    strike REAL,
-    sigma_1s REAL,
-    fav_bid0 REAL,
-    fav_ask0 REAL,
-    fav_ask_size0 REAL,
-    book_age_ms INTEGER,
-    pre_move REAL,
-    reprice_ms INTEGER,
-    mid_reprice_ms INTEGER,
-    mid_end REAL,
-    bid_end REAL,
-    move REAL,
-    ask_0 REAL,
-    ask_100 REAL,
-    ask_250 REAL,
-    ask_500 REAL,
-    ask_1000 REAL,
-    ask_2000 REAL,
-    edge_0 REAL,
-    edge_100 REAL,
-    edge_250 REAL,
-    edge_500 REAL,
-    edge_1000 REAL,
-    edge_2000 REAL,
-    bn_delay_ms REAL,
-    pm_delay_ms REAL,
-    rtt_ms REAL,
-    outcome TEXT,
-    depth0 TEXT,
-    book_path TEXT,
-    binance_path TEXT,
-    venue_x TEXT,
-    venue_paths TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_speed_events_ts ON speed_events(ts);
-CREATE INDEX IF NOT EXISTS idx_speed_events_slug ON speed_events(market_slug);
+CREATE INDEX IF NOT EXISTS idx_late_trades_ts ON late_trades(ts);
 """
-
-SPEED_COLUMNS = [
-    "id", "ts", "t0_ms", "asset", "market_slug", "sec_left", "direction", "p0", "p1", "jump_ms",
-    "price0", "price1", "strike", "sigma_1s", "fav_bid0", "fav_ask0", "fav_ask_size0", "book_age_ms",
-    "pre_move", "reprice_ms", "mid_reprice_ms", "mid_end", "bid_end", "move",
-    "ask_0", "ask_100", "ask_250", "ask_500", "ask_1000", "ask_2000",
-    "edge_0", "edge_100", "edge_250", "edge_500", "edge_1000", "edge_2000",
-    "bn_delay_ms", "pm_delay_ms", "rtt_ms", "outcome", "depth0", "book_path", "binance_path",
-    "venue_x", "venue_paths",
-]
-# Колонки speed_events, добавленные после первой версии лаборатории (16.10)
-_SPEED_MIGRATIONS = [("venue_x", "TEXT"), ("venue_paths", "TEXT")]
-
-
-def save_speed_events(rows: list[dict]) -> int:
-    """Записать события лаборатории скорости (словари с колонками SPEED_COLUMNS
-    без id) одной транзакцией."""
-    if not rows:
-        return 0
-    cols = [c for c in SPEED_COLUMNS if c != "id"]
-    sql = f"INSERT INTO speed_events ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
-    with _conn() as conn:
-        conn.executemany(sql, [tuple(r.get(c) for c in cols) for r in rows])
-    return len(rows)
-
-
-def get_speed_events_since(since_ts: int) -> list[tuple]:
-    """Строки для CSV (все колонки SPEED_COLUMNS)."""
-    with _conn() as conn:
-        cur = conn.execute(f"SELECT {', '.join(SPEED_COLUMNS)} FROM speed_events WHERE ts >= ? ORDER BY ts ASC, id ASC",
-                           (since_ts,))
-        return cur.fetchall()
-
-
-_SPEED_SUMMARY_COLS = ("asset", "direction", "p0", "p1", "fav_ask0", "pre_move", "reprice_ms", "mid_reprice_ms",
-                       "ask_0", "ask_100", "ask_250", "ask_500", "ask_1000", "ask_2000",
-                       "edge_0", "edge_100", "edge_250", "edge_500", "edge_1000", "edge_2000", "outcome",
-                       "venue_x")
-
-
-def speed_rows_since(since_ts: int) -> list[dict]:
-    """События для сводки — без тяжёлых JSON-колонок."""
-    with _conn() as conn:
-        cur = conn.execute(f"SELECT {', '.join(_SPEED_SUMMARY_COLS)} FROM speed_events WHERE ts >= ?", (since_ts,))
-        return [dict(zip(_SPEED_SUMMARY_COLS, row)) for row in cur.fetchall()]
-
-
-def cleanup_speed(before_ts: int) -> int:
-    with _conn() as conn:
-        return conn.execute("DELETE FROM speed_events WHERE ts < ?", (before_ts,)).rowcount
-
-
-HEDGE_COLUMNS = [
-    "id", "ts", "market_slug", "asset", "timeframe", "side", "entry_price", "entry_shares",
-    "entry_cost", "entry_token_id", "hedge_price", "hedge_shares", "hedge_cost", "hedge_token_id",
-    "hedge_ts", "status", "outcome", "pnl_usdc", "dry_run",
-]
-
-
-def create_hedge_position(market_slug: str, asset: str, timeframe: str, side: str,
-                           entry_price: float, entry_shares: float, entry_cost: float,
-                           entry_token_id: str, dry_run: bool) -> int:
-    with _conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO hedge_positions
-               (ts, market_slug, asset, timeframe, side, entry_price, entry_shares, entry_cost,
-                entry_token_id, status, dry_run)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open_unhedged', ?)""",
-            (int(time.time()), market_slug, asset, timeframe, side, entry_price, entry_shares,
-             entry_cost, entry_token_id, int(dry_run)),
-        )
-        return cur.lastrowid
-
-
-def get_open_hedge_position(market_slug: str, side: str):
-    with _conn() as conn:
-        cur = conn.execute(
-            "SELECT id, entry_shares, entry_cost, status FROM hedge_positions "
-            "WHERE market_slug = ? AND side = ? AND status IN ('open_unhedged', 'hedged')",
-            (market_slug, side),
-        )
-        return cur.fetchone()
-
-
-def mark_hedged(position_id: int, hedge_price: float, hedge_shares: float, hedge_cost: float,
-                hedge_token_id: str) -> None:
-    with _conn() as conn:
-        conn.execute(
-            """UPDATE hedge_positions SET status = 'hedged', hedge_price = ?, hedge_shares = ?,
-               hedge_cost = ?, hedge_token_id = ?, hedge_ts = ? WHERE id = ?""",
-            (hedge_price, hedge_shares, hedge_cost, hedge_token_id, int(time.time()), position_id),
-        )
-
-
-def settle_hedge_position(position_id: int, outcome: str, pnl_usdc: float) -> None:
-    with _conn() as conn:
-        conn.execute(
-            "UPDATE hedge_positions SET status = 'closed', outcome = ?, pnl_usdc = ? WHERE id = ?",
-            (outcome, pnl_usdc, position_id),
-        )
-
-
-def get_unsettled_hedge_positions():
-    with _conn() as conn:
-        cur = conn.execute(
-            "SELECT id, market_slug, side, entry_shares, entry_cost, hedge_shares, hedge_cost, status, dry_run "
-            "FROM hedge_positions WHERE status IN ('open_unhedged', 'hedged')"
-        )
-        return cur.fetchall()
-
-
-def get_hedge_positions_since(since_ts: int) -> list[tuple]:
-    with _conn() as conn:
-        cols = ", ".join(HEDGE_COLUMNS)
-        cur = conn.execute(f"SELECT {cols} FROM hedge_positions WHERE ts >= ? ORDER BY ts ASC", (since_ts,))
-        return cur.fetchall()
-
-# Колонки, добавленные уже после первого релиза — через ALTER TABLE, чтобы
-# не терять историю на уже задеплоенных базах. (column_name, sql_type)
-_SIGNALS_MIGRATIONS = [
-    ("atr", "REAL"),
-    ("atr_ratio_to_avg", "REAL"),
-    ("ema_fast", "REAL"),
-    ("ema_slow", "REAL"),
-    ("ema_fast_slope", "REAL"),
-    ("trend_up", "INTEGER"),
-    ("time_score", "REAL"),
-    ("distance_score", "REAL"),
-    ("trend_score", "REAL"),
-    ("vol_score", "REAL"),
-    ("liq_score", "REAL"),
-    ("ask_liquidity_usdc", "REAL"),
-    ("up_best_ask", "REAL"),
-    ("down_best_ask", "REAL"),
-    ("book_source", "TEXT"),
-    ("outcome", "TEXT"),
-    ("asset", "TEXT"),
-    ("timeframe", "TEXT"),
-    ("macd_histogram", "REAL"),
-    ("macd_bullish", "INTEGER"),
-    # Какая проверка записала тик: "slow" — обычная раз в 3 с (REST-свечи),
-    # "fast" — быстрая (цена Binance из потока, см. src/fast_signal.py; пишет
-    # только тики с сигналом, не чаще раза в 3 с на рынок).
-    ("tick_source", "TEXT"),
-    # Источник цены и страйка, по которым считался сигнал: "chainlink" (как у
-    # Polymarket при расчёте исхода) или "binance"; "none" — режим Chainlink, но
-    # его цены/страйка нет, сигнал не считался. binance_price/binance_strike —
-    # цена и страйк Binance на том же тике, чтобы сравнивать источники.
-    ("price_source", "TEXT"),
-    ("binance_price", "REAL"),
-    ("binance_strike", "REAL"),
-]
-
-_TRADES_MIGRATIONS = [
-    ("token_id", "TEXT"),
-    ("source", "TEXT"),  # 'strategy' (наш сигнал) | 'copytrade' (скопировано с отслеживаемого кошелька)
-    # С чем бот входил: ask на сигнале (entry_price — это потолок ордера),
-    # score и диапазон входа монеты на тот момент. Диапазон и ставку теперь
-    # можно задать каждой монете свои — без этих колонок по отчётам не понять,
-    # какие сделки сделаны при каких настройках.
-    ("signal_ask", "REAL"),
-    ("safety_score", "REAL"),
-    ("range_min", "REAL"),
-    ("range_max", "REAL"),
-    # Какая проверка нашла сигнал: "slow" (раз в 3 с) или "fast" (быстрая)
-    ("entry_path", "TEXT"),
-    # Бот двух стратегий (src/duo.py): "virt" — виртуальная сделка по каждому
-    # сигналу, "A" — стратегия 1️⃣ «после проигрыша», "B" — 2️⃣ «пауза после
-    # проигрыша». Пусто — обычный режим (сигнал = сделка) или копитрейдинг.
-    ("strategy", "TEXT"),
-    # Исход, который бот определил сам в момент конца рынка (по стакану в
-    # последние секунды) — только у виртуальных сделок; outcome — официальный.
-    ("early_outcome", "TEXT"),
-    # Признаки входа — чтобы по выгрузке подгонять фильтры: минут до конца,
-    # ask другой стороны и спред (цена + ask другой стороны − 1), запас до
-    # страйка в % и в ATR, волатильность (ATR к среднему). filtered — почему
-    # фильтры входа бота двух стратегий не пустили стратегии в этот рынок
-    # ("spread" / "time"), пусто — пустили (или фильтры выключены).
-    ("minutes_left", "REAL"),
-    ("opp_ask", "REAL"),
-    ("spread", "REAL"),
-    ("distance_pct", "REAL"),
-    ("distance_atr", "REAL"),
-    ("atr_ratio", "REAL"),
-    ("filtered", "TEXT"),
-]
-
-FEATURE_COLUMNS = ("minutes_left", "opp_ask", "spread", "distance_pct", "distance_atr", "atr_ratio", "filtered")
 
 
 @contextmanager
@@ -354,8 +80,7 @@ def _conn():
 
 
 # True, если при этом запуске файла базы ещё не было (создана с нуля). При
-# каждом деплое без постоянного тома на /app/data так и будет — тогда
-# настройки из Telegram и статистика сбрасываются; main.py предупреждает.
+# каждом деплое без постоянного тома на /app/data так и будет.
 DB_WAS_NEW = False
 
 
@@ -364,564 +89,144 @@ def init_db():
     DB_WAS_NEW = not os.path.exists(settings.DB_PATH)
     with _conn() as conn:
         conn.executescript(_SCHEMA)
-        existing = {row[1] for row in conn.execute("PRAGMA table_info(signals)")}
-        for col, sql_type in _SIGNALS_MIGRATIONS:
-            if col not in existing:
-                conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {sql_type}")
-        existing_trades = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
-        for col, sql_type in _TRADES_MIGRATIONS:
-            if col not in existing_trades:
-                conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {sql_type}")
-        existing_speed = {row[1] for row in conn.execute("PRAGMA table_info(speed_events)")}
-        for col, sql_type in _SPEED_MIGRATIONS:
-            if col not in existing_speed:
-                conn.execute(f"ALTER TABLE speed_events ADD COLUMN {col} {sql_type}")
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(late_trades)").fetchall()}
+        if "note" not in cols:                                    # база прошлой версии
+            conn.execute("ALTER TABLE late_trades ADD COLUMN note TEXT")
 
-
-def log_signal(market_slug: str, current_price: float, strike_price: float, decision,
-               indicators: dict | None = None, up_book=None, down_book=None,
-               tick_source: str = "slow", price_source: str | None = None,
-               binance_price: float | None = None, binance_strike: float | None = None) -> None:
-    """
-    indicators/up_book/down_book необязательны (обратная совместимость), но
-    без них отчёт для анализа будет неполным — main.py всегда должен их
-    передавать.
-    """
-    indicators = indicators or {}
-    asset, timeframe_label = parse_market_slug(market_slug)
-    with _conn() as conn:
-        conn.execute(
-            """INSERT INTO signals
-               (ts, market_slug, current_price, strike_price, direction, entry_price,
-                safety_score, minutes_left, distance_atr, should_enter, reasons,
-                atr, atr_ratio_to_avg, ema_fast, ema_slow, ema_fast_slope, trend_up,
-                time_score, distance_score, trend_score, vol_score, liq_score,
-                ask_liquidity_usdc, up_best_ask, down_best_ask, book_source, asset, timeframe,
-                macd_histogram, macd_bullish, tick_source, price_source, binance_price, binance_strike)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                int(time.time()), market_slug, current_price, strike_price, decision.direction,
-                decision.entry_price, decision.safety_score, decision.minutes_left,
-                decision.distance_atr, int(decision.should_enter), "; ".join(decision.reasons),
-                indicators.get("atr"), indicators.get("atr_ratio_to_avg"),
-                indicators.get("ema_fast"), indicators.get("ema_slow"), indicators.get("ema_fast_slope"),
-                int(indicators.get("trend_up")) if indicators.get("trend_up") is not None else None,
-                decision.time_score, decision.distance_score, decision.trend_score,
-                decision.vol_score, decision.liq_score,
-                (up_book.ask_liquidity_usdc if decision.direction == "UP" else down_book.ask_liquidity_usdc)
-                if (up_book and down_book) else None,
-                up_book.best_ask if up_book else None,
-                down_book.best_ask if down_book else None,
-                (up_book.source if decision.direction == "UP" else down_book.source)
-                if (up_book and down_book) else None,
-                asset, timeframe_label,
-                indicators.get("macd_histogram"),
-                int(indicators.get("macd_bullish")) if indicators.get("macd_bullish") is not None else None,
-                tick_source, price_source, binance_price, binance_strike,
-            ),
-        )
-
-
-def label_signals_outcome(market_slug: str, outcome: str) -> int:
-    """Проставляет исход рынка всем ещё не подписанным тикам этого рынка.
-    Возвращает число обновлённых строк."""
-    with _conn() as conn:
-        cur = conn.execute(
-            "UPDATE signals SET outcome = ? WHERE market_slug = ? AND outcome IS NULL",
-            (outcome, market_slug),
-        )
-        # Рывки ⚡ лаборатории скорости на этом рынке — тем же исходом
-        conn.execute("UPDATE speed_events SET outcome = ? WHERE market_slug = ? AND outcome IS NULL",
-                     (outcome, market_slug))
-        return cur.rowcount
-
-
-def get_markets_needing_outcome(exclude_slugs: set[str] | None, limit: int = 50) -> list[str]:
-    """Слаги рынков, у которых есть сигналы без проставленного исхода —
-    кандидаты на то, чтобы спросить Gamma API, не зарезолвились ли они."""
-    exclude_slugs = exclude_slugs or set()
-    with _conn() as conn:
-        cur = conn.execute(
-            "SELECT DISTINCT market_slug FROM signals WHERE outcome IS NULL ORDER BY ts ASC LIMIT ?",
-            (limit + len(exclude_slugs),),
-        )
-        rows = [row[0] for row in cur.fetchall() if row[0] not in exclude_slugs]
-        return rows[:limit]
-
-
-def log_trade(market_slug: str, condition_id: str, direction: str, entry_price: float,
-              size_usdc: float, order_id: str, status: str, dry_run: bool, token_id: str = "",
-              source: str = "strategy", signal_ask: float | None = None,
-              safety_score: float | None = None, range_min: float | None = None,
-              range_max: float | None = None, entry_path: str | None = None,
-              strategy: str | None = None, features: dict | None = None) -> int:
-    """features — признаки входа (FEATURE_COLUMNS), чего нет — NULL."""
-    f = features or {}
-    with _conn() as conn:
-        cur = conn.execute(
-            f"""INSERT INTO trades
-               (ts, market_slug, condition_id, direction, entry_price, size_usdc,
-                order_id, status, outcome, pnl_usdc, dry_run, token_id, source,
-                signal_ask, safety_score, range_min, range_max, entry_path, strategy,
-                {", ".join(FEATURE_COLUMNS)})
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       {", ".join("?" for _ in FEATURE_COLUMNS)})""",
-            (int(time.time()), market_slug, condition_id, direction, entry_price,
-             size_usdc, order_id, status, int(dry_run), token_id, source,
-             signal_ask, safety_score, range_min, range_max, entry_path, strategy,
-             *(f.get(c) for c in FEATURE_COLUMNS)),
-        )
-        return cur.lastrowid
-
-
-def settle_trade(trade_id: int, outcome: str, pnl_usdc: float) -> bool:
-    """Закрывает сделку, только если она ещё открыта. Резолюция и стоп-лосс
-    теперь живут в разных фоновых циклах (стоп — раз в ~2 с), поэтому
-    повторное закрытие уже закрытой сделки молча игнорируем и сообщаем об
-    этом через False — вызывающий код тогда не шлёт второе уведомление."""
-    with _conn() as conn:
-        cur = conn.execute(
-            "UPDATE trades SET outcome = ?, pnl_usdc = ? WHERE id = ? AND outcome IS NULL",
-            (outcome, pnl_usdc, trade_id),
-        )
-        return cur.rowcount > 0
-
-
-def get_open_trade_for_market(market_slug: str, strategy: str | None = None):
-    """Открытая сделка по рынку. strategy — только сделки этой стратегии
-    (бот двух стратегий: по одному рынку бывает виртуальная + 1️⃣ + 2️⃣)."""
-    q = ("SELECT id, condition_id, direction, entry_price, size_usdc FROM trades "
-         "WHERE market_slug = ? AND outcome IS NULL")
-    params: list = [market_slug]
-    if strategy is not None:
-        q += " AND strategy = ?"
-        params.append(strategy)
-    with _conn() as conn:
-        return conn.execute(q, params).fetchone()
-
-
-_INTERVAL_SEC = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
-
-
-def market_end_ts(slug: str) -> int | None:
-    """'btc-updown-5m-1791306300' -> 1791306600 (начало окна + длина). None,
-    если слаг другого формата."""
-    try:
-        _asset, label = parse_market_slug(slug)
-        start = int(slug.rsplit("-", 1)[1])
-    except (ValueError, IndexError, AttributeError):
-        return None
-    interval = _INTERVAL_SEC.get(label)
-    return start + interval if interval else None
-
-
-def count_open_trades(live_only: bool = False, running_only: bool = False, now: float | None = None) -> int:
-    """Общее число сейчас открытых позиций по ВСЕМ активам/таймфреймам —
-    используется для общего лимита позиций (см. executor.py).
-    live_only=True — только реальные: виртуальные (DRY) сделки монет в
-    режиме DRY не должны занимать место реальных.
-    running_only=True — только позиции в рынках, которые ещё идут. Отчёты
-    07.10 показали: рынок закончился, исход уже не меняется, а Gamma API
-    отмечает его закрытым через несколько минут — и всё это время позиция
-    занимала слот, а сигналы других монет пропускались."""
-    with _conn() as conn:
-        q = "SELECT market_slug FROM trades WHERE outcome IS NULL"
-        if live_only:
-            q += " AND dry_run = 0"
-        slugs = [row[0] for row in conn.execute(q).fetchall()]
-    if not running_only:
-        return len(slugs)
-    now = time.time() if now is None else now
-    count = 0
-    for slug in slugs:
-        end = market_end_ts(slug)
-        if end is None or end > now:   # формат неизвестен — считаем, как раньше
-            count += 1
-    return count
-
-
-def parse_market_slug(slug: str) -> tuple[str, str]:
-    """'sol-updown-5m-1789270200' -> ('sol', '5m'). Если формат неожиданный,
-    возвращает ('unknown', 'unknown') вместо падения — отчёты не должны
-    рушиться из-за одного странного слага."""
-    try:
-        asset, rest = slug.split("-updown-", 1)
-        label = rest.split("-", 1)[0]
-        return asset, label
-    except (ValueError, AttributeError):
-        return "unknown", "unknown"
-
-
-def get_unsettled_trades(with_strategy: bool = False):
-    """Открытые сделки: (id, slug, condition_id, direction, entry_price, size,
-    dry_run, token_id) и с with_strategy=True ещё (strategy, early_outcome)."""
-    extra = ", strategy, early_outcome" if with_strategy else ""
-    with _conn() as conn:
-        cur = conn.execute(
-            "SELECT id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run, token_id"
-            f"{extra} FROM trades WHERE outcome IS NULL",
-        )
-        return cur.fetchall()
-
-
-def get_pnl_summary(since_ts: int = 0, live_only: bool = False, dry_only: bool = False,
-                    strategy: str | None = None):
-    q = ("SELECT COUNT(*), COALESCE(SUM(pnl_usdc), 0), "
-         "SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) "
-         "FROM trades WHERE outcome IS NOT NULL AND ts >= ?")
-    params: list = [since_ts]
-    if live_only or dry_only:
-        q += " AND dry_run = ?"
-        params.append(0 if live_only else 1)
-    if strategy is not None:
-        q += " AND strategy = ?"
-        params.append(strategy)
-    with _conn() as conn:
-        count, total_pnl, wins = conn.execute(q, params).fetchone()
-        return {"trades": count or 0, "pnl_usdc": total_pnl or 0.0, "wins": wins or 0}
-
-
-def get_outcome_stats(live: bool | None = None, since_ts: int = 0, asset: str | None = None,
-                      strategy: str | None = None) -> dict:
-    """Факт против ожидания по цене входа (см. src/loss_stats.py).
-
-    Только сделки, дошедшие до резолюции (outcome UP/DOWN); досрочно
-    закрытые по стоп-лоссу (STOPPED) не считаются. expected_losses =
-    сумма (1 − entry_price): столько проигрышей «заложено» в цены входа.
-    live=True — только реальные сделки, False — только DRY RUN, None — все.
-    """
-    q = ("SELECT entry_price, pnl_usdc, direction, outcome FROM trades "
-         "WHERE outcome IN ('UP', 'DOWN') AND ts >= ?")
-    params: list = [since_ts]
-    if live is not None:
-        q += " AND dry_run = ?"
-        params.append(0 if live else 1)
-    if asset:
-        q += " AND market_slug LIKE ?"
-        params.append(f"{asset.lower()}-updown-%")
-    if strategy is not None:
-        q += " AND strategy = ?"
-        params.append(strategy)
-    with _conn() as conn:
-        rows = conn.execute(q, params).fetchall()
-    pnl_total = sum(pnl for _p, pnl, _d, _o in rows if pnl is not None)
-    win_pnls = [pnl for _p, pnl, d, o in rows if d == o and pnl is not None]
-    loss_pnls = [pnl for _p, pnl, d, o in rows if d != o and pnl is not None]
-    return {
-        "trades": len(rows),
-        "losses": sum(1 for _p, _pnl, d, o in rows if d != o),
-        "expected_losses": sum(1.0 - float(p) for p, *_ in rows if p is not None),
-        "avg_win": sum(win_pnls) / len(win_pnls) if win_pnls else 0.0,
-        "avg_loss": sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0,
-        "pnl_usdc": pnl_total,
-    }
-
-
-def get_pnl_by_asset_mode(since_ts: int = 0) -> dict[tuple[str, bool], dict]:
-    """PnL по монетам отдельно для реальных и виртуальных сделок:
-    {(asset, dry_run): {"trades", "pnl_usdc", "wins"}} — чтобы в отчётах и
-    статистике виртуальная прибыль DRY-монет не смешивалась с реальной."""
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT market_slug, pnl_usdc, dry_run FROM trades WHERE outcome IS NOT NULL AND ts >= ?",
-            (since_ts,),
-        ).fetchall()
-    out: dict[tuple[str, bool], dict] = {}
-    for slug, pnl, dry in rows:
-        asset, _label = parse_market_slug(slug)
-        b = out.setdefault((asset, bool(dry)), {"trades": 0, "pnl_usdc": 0.0, "wins": 0})
-        b["trades"] += 1
-        b["pnl_usdc"] += pnl or 0.0
-        if (pnl or 0.0) > 0:
-            b["wins"] += 1
-    return out
-
-
-def get_pnl_by_asset(since_ts: int = 0) -> dict[str, dict]:
-    """PnL/винрейт по каждому активу отдельно (суммируя все таймфреймы этого
-    актива) — для кнопки 'Статистика' в Telegram."""
-    with _conn() as conn:
-        cur = conn.execute(
-            "SELECT market_slug, pnl_usdc FROM trades WHERE outcome IS NOT NULL AND ts >= ?",
-            (since_ts,),
-        )
-        rows = cur.fetchall()
-
-    by_asset: dict[str, dict] = {}
-    for slug, pnl in rows:
-        asset, _label = parse_market_slug(slug)
-        bucket = by_asset.setdefault(asset, {"trades": 0, "pnl_usdc": 0.0, "wins": 0})
-        bucket["trades"] += 1
-        bucket["pnl_usdc"] += pnl or 0.0
-        if (pnl or 0.0) > 0:
-            bucket["wins"] += 1
-    return by_asset
-
-
-def get_pnl_by_timeframe(since_ts: int = 0) -> dict[str, dict]:
-    """То же самое, но сгруппировано по таймфрейму вместо актива (в этом боте таймфрейм всегда 5m, но колонка общая с основным ботом)."""
-    with _conn() as conn:
-        cur = conn.execute(
-            "SELECT market_slug, pnl_usdc FROM trades WHERE outcome IS NOT NULL AND ts >= ?",
-            (since_ts,),
-        )
-        rows = cur.fetchall()
-
-    by_tf: dict[str, dict] = {}
-    for slug, pnl in rows:
-        _asset, label = parse_market_slug(slug)
-        bucket = by_tf.setdefault(label, {"trades": 0, "pnl_usdc": 0.0, "wins": 0})
-        bucket["trades"] += 1
-        bucket["pnl_usdc"] += pnl or 0.0
-        if (pnl or 0.0) > 0:
-            bucket["wins"] += 1
-    return by_tf
-
-
-# --- Экспорт для периодических отчётов (см. src/reporting.py) ---
-
-SIGNALS_COLUMNS = [
-    "id", "ts", "market_slug", "asset", "timeframe", "current_price", "strike_price", "direction", "entry_price",
-    "safety_score", "minutes_left", "distance_atr", "should_enter", "reasons",
-    "atr", "atr_ratio_to_avg", "ema_fast", "ema_slow", "ema_fast_slope", "trend_up",
-    "time_score", "distance_score", "trend_score", "vol_score", "liq_score",
-    "ask_liquidity_usdc", "up_best_ask", "down_best_ask", "book_source", "outcome",
-    "macd_histogram", "macd_bullish", "tick_source", "price_source", "binance_price", "binance_strike",
-]
-
-TRADES_COLUMNS = [
-    "id", "ts", "market_slug", "condition_id", "direction", "entry_price", "size_usdc",
-    "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id", "source",
-    "signal_ask", "safety_score", "range_min", "range_max", "entry_path",
-    "strategy", "early_outcome",
-    "minutes_left", "opp_ask", "spread", "distance_pct", "distance_atr", "atr_ratio", "filtered",
-]
-
-
-MOMENTUM_COLUMNS = [
-    "id", "ts", "market_slug", "asset", "timeframe", "side", "checkpoint_price", "minutes_left",
-    "rsi", "macd_histogram", "macd_bullish", "atr", "atr_ratio_to_avg", "ema_fast", "ema_slow",
-    "ema_fast_slope", "trend_up", "bb_width", "bb_percent_b", "volume_ratio", "book_imbalance",
-    "final_outcome", "side_won",
-]
-
-
-def log_momentum_checkpoint(market_slug: str, asset: str, timeframe: str, side: str,
-                             checkpoint_price: float, minutes_left: float, indicators: dict,
-                             book_imbalance: float | None) -> None:
-    with _conn() as conn:
-        conn.execute(
-            """INSERT INTO momentum_checkpoints
-               (ts, market_slug, asset, timeframe, side, checkpoint_price, minutes_left,
-                rsi, macd_histogram, macd_bullish, atr, atr_ratio_to_avg, ema_fast, ema_slow,
-                ema_fast_slope, trend_up, bb_width, bb_percent_b, volume_ratio, book_imbalance)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                int(time.time()), market_slug, asset, timeframe, side, checkpoint_price, minutes_left,
-                indicators.get("rsi"), indicators.get("macd_histogram"),
-                int(indicators.get("macd_bullish")) if indicators.get("macd_bullish") is not None else None,
-                indicators.get("atr"), indicators.get("atr_ratio_to_avg"),
-                indicators.get("ema_fast"), indicators.get("ema_slow"), indicators.get("ema_fast_slope"),
-                int(indicators.get("trend_up")) if indicators.get("trend_up") is not None else None,
-                indicators.get("bb_width"), indicators.get("bb_percent_b"), indicators.get("volume_ratio"),
-                book_imbalance,
-            ),
-        )
-
-
-def label_momentum_outcome(market_slug: str, outcome: str) -> None:
-    with _conn() as conn:
-        conn.execute(
-            "UPDATE momentum_checkpoints SET final_outcome = ?, side_won = (side = ?) WHERE market_slug = ? AND final_outcome IS NULL",
-            (outcome, outcome, market_slug),
-        )
-
-
-def get_momentum_markets_needing_outcome(exclude_slugs: set[str] | None, limit: int = 50) -> list[str]:
-    exclude_slugs = exclude_slugs or set()
-    with _conn() as conn:
-        cur = conn.execute(
-            "SELECT DISTINCT market_slug FROM momentum_checkpoints WHERE final_outcome IS NULL ORDER BY ts ASC LIMIT ?",
-            (limit + len(exclude_slugs),),
-        )
-        rows = [row[0] for row in cur.fetchall() if row[0] not in exclude_slugs]
-        return rows[:limit]
-
-
-def get_momentum_since(since_ts: int) -> list[tuple]:
-    with _conn() as conn:
-        cols = ", ".join(MOMENTUM_COLUMNS)
-        cur = conn.execute(f"SELECT {cols} FROM momentum_checkpoints WHERE ts >= ? ORDER BY ts ASC", (since_ts,))
-        return cur.fetchall()
-
-
-def get_signals_since(since_ts: int) -> list[tuple]:
-    with _conn() as conn:
-        cols = ", ".join(SIGNALS_COLUMNS)
-        cur = conn.execute(f"SELECT {cols} FROM signals WHERE ts >= ? ORDER BY ts ASC", (since_ts,))
-        return cur.fetchall()
-
-
-def last_trade() -> tuple[str, int] | None:
-    """(market_slug, ts) последней сделки бота по своим сигналам — для
-    «🔎 Почему нет сделок»."""
-    with _conn() as conn:
-        row = conn.execute(
-            "SELECT market_slug, ts FROM trades WHERE COALESCE(source, 'strategy') = 'strategy' "
-            "ORDER BY ts DESC LIMIT 1"
-        ).fetchone()
-    return (row[0], int(row[1])) if row else None
-
-
-def get_trades_since(since_ts: int) -> list[tuple]:
-    with _conn() as conn:
-        cols = ", ".join(TRADES_COLUMNS)
-        cur = conn.execute(f"SELECT {cols} FROM trades WHERE ts >= ? ORDER BY ts ASC", (since_ts,))
-        return cur.fetchall()
-
-
-# --- Настройки, управляемые из Telegram (переживают рестарт процесса) ---
 
 def get_all_settings() -> dict[str, str]:
     with _conn() as conn:
-        cur = conn.execute("SELECT key, value FROM bot_settings")
-        return {k: v for k, v in cur.fetchall()}
+        return {k: v for k, v in conn.execute("SELECT key, value FROM bot_settings").fetchall()}
+
+
+def get_setting(key: str) -> str | None:
+    with _conn() as conn:
+        row = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
 
 
 def set_setting(key: str, value) -> None:
     with _conn() as conn:
-        conn.execute(
-            "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, str(value)),
-        )
+        conn.execute("INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
 
 
-# --- Бот двух стратегий (src/duo.py) ---
+# --------------------------------------------------------------- окна ----
 
-def set_early_outcome(trade_id: int, outcome: str) -> None:
-    """Исход, который бот определил сам в момент конца рынка (до официальной
-    резолюции) — у виртуальной сделки."""
+WINDOW_COLUMNS = ["id", "asset", "start_ts", "slug", "strike", "path", "cl_end", "early_outcome", "outcome"]
+_WINDOW_FIELDS = set(WINDOW_COLUMNS) - {"id", "asset", "start_ts"}
+
+
+def window_upsert(asset: str, start_ts: int, **fields) -> None:
+    bad = set(fields) - _WINDOW_FIELDS
+    if bad:
+        raise ValueError(f"неизвестные поля: {bad}")
     with _conn() as conn:
-        conn.execute("UPDATE trades SET early_outcome = ? WHERE id = ?", (outcome, trade_id))
+        conn.execute("INSERT OR IGNORE INTO late_windows (asset, start_ts) VALUES (?, ?)", (asset, int(start_ts)))
+        if fields:
+            cols = sorted(fields)
+            conn.execute(f"UPDATE late_windows SET {', '.join(f'{c} = ?' for c in cols)} "
+                         "WHERE asset = ? AND start_ts = ?", [fields[c] for c in cols] + [asset, int(start_ts)])
 
 
-def virtual_trades_since(since_ts: int) -> list[tuple]:
-    """Виртуальные сделки: (id, market_slug, direction, outcome, early_outcome)
-    по порядку входа."""
+def window_rows(since_ts: int = 0, with_path: bool = False) -> list[dict]:
+    cols = [c for c in WINDOW_COLUMNS if with_path or c != "path"]
     with _conn() as conn:
-        return conn.execute(
-            "SELECT id, market_slug, direction, outcome, early_outcome FROM trades "
-            "WHERE strategy = 'virt' AND ts >= ? ORDER BY ts ASC, id ASC", (since_ts,),
-        ).fetchall()
+        rows = conn.execute(f"SELECT {', '.join(cols)} FROM late_windows WHERE start_ts >= ? "
+                            "ORDER BY asset, start_ts", (since_ts,)).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
 
 
-def virtual_filtered_since(since_ts: int) -> dict[str, str]:
-    """{market_slug: причина} виртуальных сделок, рынки которых фильтры входа
-    закрыли для стратегий (для восстановления состояния при старте)."""
+def window_outcome(asset: str, start_ts: int) -> str | None:
     with _conn() as conn:
-        rows = conn.execute(
-            "SELECT market_slug, filtered FROM trades WHERE strategy = 'virt' AND ts >= ? "
-            "AND filtered IS NOT NULL AND filtered != ''", (since_ts,),
-        ).fetchall()
-    return {slug: reason for slug, reason in rows}
+        row = conn.execute("SELECT outcome FROM late_windows WHERE asset = ? AND start_ts = ?",
+                           (asset, int(start_ts))).fetchone()
+    return row[0] if row and row[0] else None
 
 
-def filter_summary(since_ts: int = 0) -> dict[str, dict]:
-    """Виртуальные сделки с официальным исходом по результату фильтров входа:
-    {"" — прошли (или фильтры были выкл), "spread", "time": {"trades",
-    "losses", "expected_losses", "pnl_usdc"}}."""
-    with _conn() as conn:
-        rows = conn.execute(
-            "SELECT COALESCE(filtered, ''), entry_price, direction, outcome, pnl_usdc FROM trades "
-            "WHERE strategy = 'virt' AND outcome IN ('UP', 'DOWN') AND ts >= ?", (since_ts,),
-        ).fetchall()
-    out: dict[str, dict] = {}
-    for reason, price, direction, outcome, pnl in rows:
-        b = out.setdefault(reason, {"trades": 0, "losses": 0, "expected_losses": 0.0, "pnl_usdc": 0.0})
-        b["trades"] += 1
-        b["losses"] += int(direction != outcome)
-        b["expected_losses"] += 1.0 - float(price or 0)
-        b["pnl_usdc"] += pnl or 0.0
-    return out
-
-
-def virtual_feature_rows(since_ts: int = 0) -> list[tuple]:
-    """Виртуальные сделки с официальным исходом и признаками входа:
-    (entry_price, direction, outcome, pnl_usdc, minutes_left, spread)."""
+def windows_unresolved(ended_before: int, since_ts: int, limit: int = 30) -> list[tuple[str, int, str]]:
+    """Окна без официального исхода, закончившиеся раньше ended_before: (монета, старт, слаг)."""
     with _conn() as conn:
         return conn.execute(
-            "SELECT entry_price, direction, outcome, pnl_usdc, minutes_left, spread FROM trades "
-            "WHERE strategy = 'virt' AND outcome IN ('UP', 'DOWN') AND ts >= ?", (since_ts,),
-        ).fetchall()
+            "SELECT asset, start_ts, slug FROM late_windows WHERE outcome IS NULL AND slug IS NOT NULL "
+            "AND start_ts >= ? AND start_ts + 300 < ? ORDER BY start_ts DESC LIMIT ?",
+            (since_ts, ended_before, limit)).fetchall()
 
 
-def trade_filtered(trade_id: int) -> str:
-    """Причина фильтра входа у сделки ("" — нет)."""
+def windows_trim(before_ts: int) -> int:
+    """Стереть путь у окон старше before_ts (страйк и исходы остаются)."""
     with _conn() as conn:
-        row = conn.execute("SELECT filtered FROM trades WHERE id = ?", (trade_id,)).fetchone()
-    return (row[0] or "") if row else ""
+        return conn.execute("UPDATE late_windows SET path = NULL WHERE start_ts < ? AND path IS NOT NULL",
+                            (int(before_ts),)).rowcount
 
 
-def strategy_entries_since(since_ts: int) -> list[tuple]:
-    """(market_slug, strategy) входов стратегий 1️⃣ и 2️⃣ с момента since_ts."""
+def windows_export(since_ts: int, until_ts: int | None = None) -> list[tuple]:
+    """Окна с since_ts (и до until_ts, не включая) — для отчётов."""
+    q = f"SELECT {', '.join(WINDOW_COLUMNS)} FROM late_windows WHERE start_ts >= ?"
+    args: list = [int(since_ts)]
+    if until_ts is not None:
+        q += " AND start_ts < ?"
+        args.append(int(until_ts))
     with _conn() as conn:
-        return conn.execute(
-            "SELECT market_slug, strategy FROM trades WHERE strategy IN ('A', 'B') AND ts >= ?",
-            (since_ts,),
-        ).fetchall()
+        return conn.execute(q + " ORDER BY start_ts, asset", args).fetchall()
 
 
-def get_strategy_summary(since_ts: int = 0) -> dict[tuple[str, bool], dict]:
-    """Итоги по стратегиям: {(strategy, dry_run): {"trades", "losses",
-    "expected_losses", "pnl_usdc"}} — только сделки с исходом UP/DOWN."""
+def windows_first_ts() -> int | None:
     with _conn() as conn:
-        rows = conn.execute(
-            "SELECT strategy, dry_run, entry_price, direction, outcome, pnl_usdc FROM trades "
-            "WHERE outcome IN ('UP', 'DOWN') AND strategy IS NOT NULL AND ts >= ?", (since_ts,),
-        ).fetchall()
-    out: dict[tuple[str, bool], dict] = {}
-    for strat, dry, price, direction, outcome, pnl in rows:
-        b = out.setdefault((strat, bool(dry)), {"trades": 0, "losses": 0, "expected_losses": 0.0, "pnl_usdc": 0.0})
-        b["trades"] += 1
-        b["losses"] += int(direction != outcome)
-        b["expected_losses"] += 1.0 - float(price or 0)
-        b["pnl_usdc"] += pnl or 0.0
-    return out
+        row = conn.execute("SELECT MIN(start_ts) FROM late_windows").fetchone()
+    return int(row[0]) if row and row[0] is not None else None
 
 
-def virtual_results_since(since_ts: int) -> list[tuple]:
-    """Виртуальные сделки с исходом: (ts входа, market_slug, entry_price,
-    выиграла ли, pnl_usdc) — официальный исход, иначе ранний."""
+# ------------------------------------------------------------- ставки ----
+
+TRADE_COLUMNS = [
+    "id", "ts", "asset", "start_ts", "slug", "side", "token_id", "t_left", "price_now", "strike", "dist_pct",
+    "dist_atr", "atr", "ask", "price", "size_usdc", "shares", "fee_usdc", "dry_run", "status", "order_id",
+    "outcome", "pnl_usdc", "settled_ts", "rule", "note",
+]
+
+
+def trade_log(**f) -> int | None:
+    """Записать ставку. None — по этому окну такая ставка уже есть."""
+    cols = [c for c in TRADE_COLUMNS if c in f and c != "id"]
     with _conn() as conn:
-        rows = conn.execute(
-            "SELECT ts, market_slug, entry_price, direction, outcome, early_outcome, pnl_usdc FROM trades "
-            "WHERE strategy = 'virt' AND ts >= ? ORDER BY ts ASC, id ASC", (since_ts,),
-        ).fetchall()
-    out = []
-    for ts, slug, price, direction, outcome, early, pnl in rows:
-        res = outcome if outcome in ("UP", "DOWN") else (early if early in ("UP", "DOWN") else None)
-        if res is not None:
-            out.append((int(ts), slug, float(price or 0), res == direction, pnl))
-    return out
+        cur = conn.execute(f"INSERT OR IGNORE INTO late_trades ({', '.join(cols)}) "
+                           f"VALUES ({', '.join('?' for _ in cols)})", [f[c] for c in cols])
+        return cur.lastrowid if cur.rowcount else None
 
 
-def strategy_trade(market_slug: str, strategy: str):
-    """Сделка стратегии в рынке: (id, size_usdc, dry_run, direction) или None."""
+def trade_exists(asset: str, start_ts: int, dry_run: bool | None = None) -> bool:
+    q = "SELECT 1 FROM late_trades WHERE asset = ? AND start_ts = ?"
+    args: list = [asset, int(start_ts)]
+    if dry_run is not None:
+        q += " AND dry_run = ?"
+        args.append(int(bool(dry_run)))
     with _conn() as conn:
-        return conn.execute(
-            "SELECT id, size_usdc, dry_run, direction FROM trades WHERE market_slug = ? AND strategy = ? "
-            "ORDER BY id ASC LIMIT 1", (market_slug, strategy),
-        ).fetchone()
+        return conn.execute(q + " LIMIT 1", args).fetchone() is not None
 
 
-def coin_strategy_pnl(asset: str, dry: bool) -> float:
-    """Итог закрытых сделок стратегий 1️⃣ и 2️⃣ по монете: реальных (dry=False)
-    или тестовых (dry=True) — для банка монеты."""
+def trades_open(ended_before: int) -> list[dict]:
     with _conn() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(pnl_usdc), 0) FROM trades WHERE outcome IS NOT NULL "
-            "AND strategy IN ('A', 'B') AND dry_run = ? AND market_slug LIKE ?",
-            (1 if dry else 0, f"{asset.lower()}-updown-%"),
-        ).fetchone()
-    return float(row[0] or 0.0)
+        rows = conn.execute(f"SELECT {', '.join(TRADE_COLUMNS)} FROM late_trades WHERE outcome IS NULL "
+                            "AND start_ts + 300 < ? ORDER BY start_ts", (ended_before,)).fetchall()
+    return [dict(zip(TRADE_COLUMNS, r)) for r in rows]
+
+
+def trade_settle(trade_id: int, outcome: str, pnl_usdc: float) -> bool:
+    with _conn() as conn:
+        cur = conn.execute("UPDATE late_trades SET outcome = ?, pnl_usdc = ?, settled_ts = ? "
+                           "WHERE id = ? AND outcome IS NULL", (outcome, pnl_usdc, int(time.time()), trade_id))
+        return cur.rowcount > 0
+
+
+def trades_since(since_ts: int) -> list[dict]:
+    with _conn() as conn:
+        rows = conn.execute(f"SELECT {', '.join(TRADE_COLUMNS)} FROM late_trades WHERE ts >= ? ORDER BY ts",
+                            (since_ts,)).fetchall()
+    return [dict(zip(TRADE_COLUMNS, r)) for r in rows]
+
+
+def trades_export(since_ts: int) -> list[tuple]:
+    with _conn() as conn:
+        return conn.execute(f"SELECT {', '.join(TRADE_COLUMNS)} FROM late_trades WHERE ts >= ? ORDER BY ts",
+                            (since_ts,)).fetchall()

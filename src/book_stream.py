@@ -1,18 +1,10 @@
 """
-Живой стакан по WebSocket вместо REST-поллинга.
+Живой стакан Polymarket по WebSocket.
 
-Раньше (v1) бот на каждом тике дёргал REST `GET /book` — это лишние
-100-300ms сетевого раунд-трипа именно в момент принятия решения о входе,
-и цена, на которую мы смотрим, могла на несколько сотен мс отставать от
-реальной. Плюс Polymarket сам по себе обновляет свою книгу с задержкой
-относительно бирж типа Binance — так что "прогретый" WS-стакан не убирает
-этот системный лаг, но убирает НАШУ собственную задержку поверх него.
-
-Идея "прогрева": подписываемся на токены рынка сразу, как только рынок
-обнаружен (за много минут до возможного входа), и держим соединение
-открытым. К моменту, когда strategy.evaluate() реально нужна цена аска,
-она уже лежит в памяти, обновлённая пушем с сервера, а не тем, что мы
-только что сходили и спросили.
+Токены рынка подписываем заранее — 🔁 запись окон находит рынок следующего
+окна за полторы минуты до старта, — и держим соединение открытым: к моменту
+входа цена уже лежит в памяти, обновлённая пушем с сервера, без REST-запроса
+в момент решения.
 
 Формат сообщений — по официальной документации Polymarket
 (wss://ws-subscriptions-clob.polymarket.com/ws/market):
@@ -27,8 +19,6 @@ import time
 
 import websockets
 
-from config import settings
-
 log = logging.getLogger("book_stream")
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -42,12 +32,16 @@ _ws_ready = asyncio.Event()
 # Когда токен добавлен в подписку — чтобы сторож мог понять, что данные по
 # нему так и не пришли (см. _watchdog).
 _subscribed_at: dict[str, int] = {}
+# Рынок, который ещё не начался (бот подписывает следующее окно 5m
+# заранее): стакана по нему может не быть до старта — сторож до этого момента
+# (мс) на такие токены не смотрит, иначе рвал бы сокет всем каждые 30 с.
+_watch_after: dict[str, int] = {}
 _last_forced_reconnect_ms = 0
 WATCHDOG_NO_DATA_MS = 8000        # подписаны столько, а стакана так и нет — переподключаемся
 WATCHDOG_MIN_INTERVAL_MS = 30000  # не чаще раза в 30 с
 # Кому сообщать об изменении стакана токена: fn(asset_id, recv_ms, server_ms).
 # server_ms — поле timestamp сообщения Polymarket (их часы), может быть None.
-# Сейчас — ⚡ лаборатории скорости (src/speed_lab.py).
+# Сейчас слушателей нет — крючок оставлен для исследований.
 _listeners: list = []
 
 
@@ -124,9 +118,15 @@ def _apply_delta(msg: dict) -> list[str]:
     return touched
 
 
-def subscribe(asset_ids: list[str]) -> None:
+def subscribe(asset_ids: list[str], watch_after_ms: int | None = None) -> None:
     """Идемпотентно добавляем токены в подписку. Реально уходит в сокет,
-    когда соединение поднято — если сокета ещё нет, он подхватит при коннекте."""
+    когда соединение поднято — если сокета ещё нет, он подхватит при коннекте.
+    watch_after_ms — не ждать стакан по этим токенам раньше этого момента
+    (рынок следующего окна, подписанный заранее; см. _watchdog)."""
+    if watch_after_ms:
+        for a in asset_ids:
+            if a:
+                _watch_after[a] = int(watch_after_ms)
     new_ids = [a for a in asset_ids if a and a not in _subscribed]
     if not new_ids:
         return
@@ -158,6 +158,7 @@ def unsubscribe(asset_ids: list[str]) -> None:
     for a in removed:
         _subscribed.discard(a)
         _subscribed_at.pop(a, None)
+        _watch_after.pop(a, None)
         _books.pop(a, None)
     try:
         _send_queue.put_nowait({"operation": "unsubscribe", "assets_ids": removed})
@@ -183,6 +184,19 @@ def best_bid(asset: str) -> float | None:
     return max(b["bids"])
 
 
+def top_of_book(asset: str) -> tuple:
+    """(лучший бид, объём на нём, лучший аск, объём на нём). None по отсутствующей стороне.
+    Один проход по стакану — для записи точки пути (симуляция мейкера хочет и бид, и объёмы)."""
+    b = _books.get(asset)
+    if not b:
+        return (None, None, None, None)
+    bids, asks = b.get("bids") or {}, b.get("asks") or {}
+    bid = max(bids) if bids else None
+    ask = min(asks) if asks else None
+    return (bid, bids.get(bid) if bid is not None else None,
+            ask, asks.get(ask) if ask is not None else None)
+
+
 def ask_liquidity_usdc(asset: str, depth_levels: int = 5) -> float:
     b = _books.get(asset)
     if not b or not b.get("asks"):
@@ -198,27 +212,6 @@ def ask_liquidity_upto(asset: str, max_price: float) -> float:
     if not b or not b.get("asks"):
         return 0.0
     return sum(price * size for price, size in b["asks"].items() if price <= max_price + 1e-9)
-
-
-def book_imbalance(asset: str, depth_levels: int = 10) -> float | None:
-    """
-    Дисбаланс стакана: доля объёма на покупку (bid) от общего объёма
-    (bid+ask) в первых depth_levels уровнях. >0.5 — давление вверх
-    (больше желающих купить, чем продать по видимым ценам), <0.5 — вниз.
-    Используется в momentum_tracker как один из индикаторов возможного
-    продолжения движения цены — сырой сигнал давления, которого нет ни
-    в ATR/EMA (это про историю цены), ни в объёме свечи Binance (это
-    вообще про другой рынок, BTC/USDT, а не про сам контракт Polymarket).
-    """
-    b = _books.get(asset)
-    if not b or (not b.get("bids") and not b.get("asks")):
-        return None
-    bid_vol = sum(size for _, size in sorted(b.get("bids", {}).items(), reverse=True)[:depth_levels])
-    ask_vol = sum(size for _, size in sorted(b.get("asks", {}).items())[:depth_levels])
-    total = bid_vol + ask_vol
-    if total <= 0:
-        return None
-    return bid_vol / total
 
 
 def tick_size(asset: str) -> float:
@@ -239,6 +232,13 @@ async def _sender(ws) -> None:
         await ws.send(json.dumps(payload))
 
 
+def _missing_books(ts: int) -> list[str]:
+    """Подписанные токены без стакана дольше WATCHDOG_NO_DATA_MS — считая от
+    подписки, а у рынка следующего окна — от его старта (_watch_after)."""
+    return [a for a in _subscribed if a not in _books
+            and ts - max(_subscribed_at.get(a, ts), _watch_after.get(a, 0)) > WATCHDOG_NO_DATA_MS]
+
+
 async def _watchdog(ws) -> None:
     """Страховка на случай, если сервер всё равно не прислал стакан по новому
     токену: переподключаемся — при коннекте уходит стартовое сообщение с
@@ -247,8 +247,7 @@ async def _watchdog(ws) -> None:
     while True:
         await asyncio.sleep(3)
         ts = now_ms()
-        missing = [a for a in _subscribed
-                   if a not in _books and ts - _subscribed_at.get(a, ts) > WATCHDOG_NO_DATA_MS]
+        missing = _missing_books(ts)
         if missing and ts - _last_forced_reconnect_ms > WATCHDOG_MIN_INTERVAL_MS:
             _last_forced_reconnect_ms = ts
             log.warning("Нет стакана по %d токенам после подписки — переподключаю WS", len(missing))
