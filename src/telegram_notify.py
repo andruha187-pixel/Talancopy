@@ -5,7 +5,7 @@
   ⚙️ Настройки — вкл/выкл, окно входа (за сколько до конца), цена, до страйка
                  (% и ATR), сумма входа, дневной стоп; ✏️ — своё значение сообщением
   🪙 Монеты    — у каждой: ✅ вкл / ⏸ выкл, 🧪 тест / 🔴 реально и 💵 своя сумма входа
-                 (общая, фиксированная $ или % от банка)
+                 (общая, фиксированная $ или % от банка) и 🏦 свой банк монеты
   📊 Статистика · 📤 Файлы
   🔴 Включить LIVE (с подтверждением) / 🧪 Выключить LIVE
 
@@ -116,7 +116,11 @@ def coins_text() -> str:
              "✅ — бот ставит по монете, ⏸ — нет (окна всё равно пишутся — чтобы потом выбрать монеты по архивам).",
              "🧪 — только тестовые ставки, 🔴 — ещё и реальные, когда бот в 🔴 LIVE.",
              "💵 — сумма входа монеты: общая (⚙️), своя фиксированная $ или % от банка.",
+             "🏦 — у монеты свой банк: растёт и падает только от её реальных ставок (задаётся в 💵).",
              ""] + late_bot.coin_lines() + ["", "Режим: " + late_bot.mode_text()]
+    warn = late_bot.banks_warning()
+    if warn:
+        lines.append(warn)
     return "\n".join(lines)
 
 
@@ -136,17 +140,23 @@ def coins_markup() -> InlineKeyboardMarkup:
 def coin_stake_text(asset: str, head: str = "") -> str:
     lb = late_bot
     mode, _value = lb.stake_rule(asset)
+    a = asset.upper()
     lines = ([head, ""] if head else []) + [
-        f"💵 {asset.upper()} — сумма входа",
+        f"💵 {a} — сумма входа",
         f"Сейчас: {lb.stake_label(asset)}" + (" (как в ⚙️ Настройках)" if mode == "общая" else "") + ".",
         "",
         f"• общая — как в ⚙️ Настройках (сейчас ${lb.stake():g});",
         "• $ — своя фиксированная сумма;",
-        "• % — доля банка в момент входа. Банк — баланс кошелька Polymarket (читается раз в минуту); не "
-        "читается — банк, заданный вручную (🏦); неизвестен — монета ставит общую сумму.",
+        f"• % — доля банка в момент входа: своего банка {a} (🏦), а если его нет — общего (баланс кошелька "
+        "Polymarket, читается раз в минуту; не читается — заданный вручную; неизвестен — общая сумма).",
+        "",
+        f"🏦 Свой банк {a} — отдельный счёт монеты: задаёшь сумму, дальше он растёт и падает только от "
+        f"реальных ставок {a}. Ставка не больше свободных денег банка; кончились — реальные ставки по {a} "
+        "не идут (тест идёт), пока не задашь банк заново.",
         "Меньше 5 акций биржа не берёт (при цене 0.95 это ~$4.8) — ставка будет не меньше. Тестовые ставки "
         "считаются с той же суммой.",
         "",
+        lb.coin_bank_line(asset),
         lb.bank_line(),
     ]
     return "\n".join(lines)
@@ -155,13 +165,16 @@ def coin_stake_text(asset: str, head: str = "") -> str:
 def coin_stake_markup(asset: str) -> InlineKeyboardMarkup:
     lb = late_bot
     mode, value = lb.stake_rule(asset)
+    own = runtime_state.coin_bank(asset)
     return _menu(
         (Btn(_mark(mode == "общая") + f"общая (${lb.stake():g})", callback_data=f"csg:{asset}"),),
         tuple(Btn(_mark(mode == "usd" and _same(value, v)) + f"${v:g}", callback_data=f"csu:{asset}:{v:g}")
               for v in lb.STAKE_PRESETS) + (Btn("✏️ $", callback_data=f"in:cu:{asset}"),),
         tuple(Btn(_mark(mode == "pct" and _same(value, v)) + f"{v:g}%", callback_data=f"csp:{asset}:{v:g}")
               for v in lb.PCT_PRESETS) + (Btn("✏️ %", callback_data=f"in:cp:{asset}"),),
-        (Btn("🏦 ✏️ банк вручную", callback_data=f"in:bank:{asset}"),),
+        (Btn(f"🏦 ✏️ свой банк {asset.upper()}", callback_data=f"in:cb:{asset}"),)
+        + ((Btn("🏦 ✖️ убрать свой банк", callback_data=f"cbx:{asset}"),) if own else ()),
+        (Btn("🏦 ✏️ общий банк вручную", callback_data=f"in:bank:{asset}"),),
         (Btn("◀️ Монеты", callback_data="co"), BACK),
     )
 
@@ -169,22 +182,38 @@ def coin_stake_markup(asset: str) -> InlineKeyboardMarkup:
 COIN_PROMPTS = {
     "cu": "✏️ {A}: своя сумма входа в $ — например «15» или «7.5» (от 1 до 1000).",
     "cp": "✏️ {A}: сумма входа в % от банка — например «3» или «2.5» (от 0.1 до 100).",
-    "bank": "✏️ Банк для ставок в % — в $, например «200». Берётся, только если баланс кошелька прочитать "
-            "нельзя. 0 — не задан.",
+    "cb": "✏️ {A}: свой банк монеты в $ — например «100». С этой минуты банк {A} = эта сумма + результат её "
+          "реальных ставок. Задашь заново — счёт начнётся с новой суммы. «0» или «нет» — убрать свой банк "
+          "(ставки в % снова от общего банка).",
+    "bank": "✏️ Общий банк для ставок в % — в $, например «200». Берётся у монет без своего банка и только "
+            "если баланс кошелька прочитать нельзя. 0 — не задан.",
 }
 
 
 def coin_prompt_text(kind: str, asset: str, head: str = "") -> str:
     lb = late_bot
-    cur = {"cu": lb.stake_label(asset), "cp": lb.stake_label(asset),
-           "bank": (f"${float(runtime_state.get('late_bank_manual') or 0):g}"
-                    if float(runtime_state.get("late_bank_manual") or 0) > 0 else "не задан")}[kind]
+    if kind in ("cu", "cp"):
+        cur = lb.stake_label(asset)
+    elif kind == "cb":
+        cur = lb.coin_bank_short(asset)
+    else:
+        manual = float(runtime_state.get("late_bank_manual") or 0)
+        cur = f"${manual:g}" if manual > 0 else "не задан"
     return ((head + "\n\n") if head else "") + COIN_PROMPTS[kind].format(A=asset.upper()) + f"\nСейчас: {cur}."
 
 
 def apply_coin_stake(asset: str, mode: str | None, value: float | None = None) -> str:
     runtime_state.set_coin_stake(asset, mode, value)
     return f"✅ {asset.upper()}: сумма входа — {late_bot.stake_label(asset)}."
+
+
+def apply_coin_bank(asset: str, value: float | None) -> str:
+    a = asset.upper()
+    if not value or value <= 0:
+        runtime_state.set_coin_bank(asset, None)
+        return f"✅ {a}: свой банк убран — ставки в % считаются от общего банка."
+    runtime_state.set_coin_bank(asset, round(value, 2))
+    return f"✅ {a}: свой банк ${value:g} — с этой минуты он растёт и падает только от реальных ставок {a}."
 
 
 def apply_coin_input(kind: str, asset: str, text: str) -> str:
@@ -194,6 +223,8 @@ def apply_coin_input(kind: str, asset: str, text: str) -> str:
     if kind == "cp":
         return apply_coin_stake(asset, "pct", parse_number(text.replace("%", ""), *runtime_state.PCT_LIMITS,
                                                            allow_off=False))
+    if kind == "cb":
+        return apply_coin_bank(asset, parse_number(text.replace("$", ""), *runtime_state.BANK_LIMITS))
     if kind == "bank":
         v = parse_number(text.replace("$", ""), *runtime_state.BANK_LIMITS)
         runtime_state.set("late_bank_manual", round(v, 2))
@@ -406,7 +437,7 @@ def handle_text(text: str) -> tuple[str, InlineKeyboardMarkup]:
     kind = _await.get("kind")
     if not kind:
         return main_text(), main_markup()
-    if ":" in kind:                                   # своя сумма монеты / банк: «cu:btc», «cp:eth», «bank:sol»
+    if ":" in kind:                       # сумма / банк монеты: «cu:btc», «cp:eth», «cb:btc», «bank:sol»
         ckind, asset = kind.split(":", 1)
         try:
             head = apply_coin_input(ckind, asset, text)
@@ -512,9 +543,11 @@ async def handle(data: str) -> tuple[str, InlineKeyboardMarkup]:
         return res
     if cmd == "co":
         return coins_text(), coins_markup()
-    if cmd in ("cs", "csg", "csu", "csp") and len(parts) >= 2 and parts[1] in settings.ASSETS:
+    if cmd in ("cs", "csg", "csu", "csp", "cbx") and len(parts) >= 2 and parts[1] in settings.ASSETS:
         asset, head = parts[1], ""
-        if cmd == "csg" and runtime_state.coin_stake(asset):
+        if cmd == "cbx" and runtime_state.coin_bank(asset):
+            head = apply_coin_bank(asset, None)
+        elif cmd == "csg" and runtime_state.coin_stake(asset):
             head = apply_coin_stake(asset, None)
         elif cmd in ("csu", "csp") and len(parts) == 3:
             v = _float(parts[2])

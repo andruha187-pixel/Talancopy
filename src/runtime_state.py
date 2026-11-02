@@ -5,9 +5,13 @@
 
 Живут в памяти, каждое изменение сразу пишется в SQLite (`bot_settings`) и
 переживает рестарт — если база на постоянном томе (/app/data).
+
+У монеты может быть своя сумма входа (💵: $ или % банка) и свой банк (🏦): сумма,
+с которой монета стартовала, и момент, с которого считаем её реальные ставки.
 """
 from __future__ import annotations
 import json
+import time
 
 from config import settings
 from src import storage
@@ -45,6 +49,21 @@ def _stakes_json(v) -> str:
     return json.dumps(out, sort_keys=True)
 
 
+def _banks_json(v) -> str:
+    """Свои банки монет: {"btc": {"start": 100, "since": 1793600000}} — проверенный JSON (сумма > 0)."""
+    raw = json.loads(v) if isinstance(v, str) else dict(v or {})
+    out = {}
+    for asset, cfg in (raw or {}).items():
+        try:
+            start, since = float(cfg.get("start")), int(float(cfg.get("since") or 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not start > 0:
+            continue
+        out[str(asset).lower()] = {"start": round(min(BANK_LIMITS[1], start), 2), "since": max(0, since)}
+    return json.dumps(out, sort_keys=True)
+
+
 def _sec(v) -> int:
     return int(min(WINDOW_LIMITS[1], max(WINDOW_LIMITS[0], int(float(v)))))
 
@@ -72,6 +91,8 @@ _DEFAULTS = {
     "late_coin_stakes": "{}",
     # банк для ставок в % — если баланс кошелька не читается (0 — не задан)
     "late_bank_manual": max(0.0, settings.LATE_BANK_USDC),
+    # свой банк монеты: сумма и с какого момента считаем её реальные ставки (нет записи — общий банк)
+    "late_coin_banks": "{}",
 }
 
 _CASTERS = {
@@ -90,6 +111,7 @@ _CASTERS = {
     "late_rule_since": lambda v: int(float(v)),
     "late_coin_stakes": _stakes_json,
     "late_bank_manual": lambda v: min(BANK_LIMITS[1], max(BANK_LIMITS[0], float(v))),
+    "late_coin_banks": _banks_json,
 }
 
 _state: dict = dict(_DEFAULTS)
@@ -176,3 +198,27 @@ def set_coin_stake(asset: str, mode: str | None, value: float | None = None) -> 
     else:
         stakes[asset.lower()] = {"mode": mode, "value": float(value)}
     set("late_coin_stakes", _stakes_json(stakes))
+
+
+# --- Свой банк монеты: (сумма, с какого момента считаем её ставки); None — общий банк ---
+
+def coin_banks() -> dict:
+    try:
+        return json.loads(str(_state.get("late_coin_banks") or "{}"))
+    except ValueError:
+        return {}
+
+
+def coin_bank(asset: str) -> tuple[float, int] | None:
+    cfg = coin_banks().get(asset.lower())
+    return (float(cfg["start"]), int(cfg["since"])) if cfg else None
+
+
+def set_coin_bank(asset: str, start: float | None, since: int | None = None) -> None:
+    """start > 0 — свой банк монеты с этой суммы, считаем с since (по умолчанию — сейчас); None/0 — убрать."""
+    banks = coin_banks()
+    if not start or start <= 0:
+        banks.pop(asset.lower(), None)
+    else:
+        banks[asset.lower()] = {"start": float(start), "since": int(time.time() if since is None else since)}
+    set("late_coin_banks", _banks_json(banks))

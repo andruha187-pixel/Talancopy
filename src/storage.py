@@ -230,3 +230,15 @@ def trades_export(since_ts: int) -> list[tuple]:
     with _conn() as conn:
         return conn.execute(f"SELECT {', '.join(TRADE_COLUMNS)} FROM late_trades WHERE ts >= ? ORDER BY ts",
                             (since_ts,)).fetchall()
+
+
+def coin_bank_flow(asset: str, since_ts: int) -> tuple[float, float]:
+    """Для своего банка монеты: (закрытый результат её реальных ставок с since_ts, сколько сейчас стоит в
+    открытых реальных ставках вместе с комиссией). Тестовые и неисполненные (SKIP_NOFILL, $0) не считаются."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(CASE WHEN outcome IS NOT NULL THEN COALESCE(pnl_usdc, 0) END), 0), "
+            "COALESCE(SUM(CASE WHEN outcome IS NULL THEN COALESCE(size_usdc, 0) + COALESCE(fee_usdc, 0) END), 0) "
+            "FROM late_trades WHERE asset = ? AND dry_run = 0 AND ts >= ? AND COALESCE(size_usdc, 0) > 0",
+            (asset.lower(), int(since_ts))).fetchone()
+    return float(row[0] or 0.0), float(row[1] or 0.0)

@@ -16,8 +16,11 @@
 
 Ставки — по включённым монетам (🪙): тестовая всегда, реальная — если монета 🔴
 и бот в 🔴 LIVE, есть ключ и не достигнут дневной стоп. Одна ставка на окно.
-Сумма — общая (⚙️) или своя у монеты (🪙 💵): фиксированная $ или % от банка
-(баланс кошелька; не читается — банк, заданный вручную).
+Сумма — общая (⚙️) или своя у монеты (🪙 💵): фиксированная $ или % от банка.
+Банк — свой у монеты (🏦: заданная сумма + результат её реальных ставок с этого
+момента; ставка не больше его свободных денег, кончились — реальные по монете
+не идут, тест идёт), а если своего нет — общий: баланс кошелька (не читается —
+банк, заданный вручную).
 
 Реальный ордер (FAK, не дороже ask + 1¢) не исполнился или исполнился частично —
 бот пробует снова каждые LIVE_RETRY_SEC, пока идёт окно входа и условия
@@ -37,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -290,39 +294,85 @@ def bank() -> tuple[float | None, str]:
     return None, ""
 
 
+def coin_bank(asset: str) -> dict | None:
+    """Свой банк монеты (🏦): start — заданная сумма, since — с какого момента считаем, pnl — закрытый
+    результат её реальных ставок с тех пор, now = start + pnl, open — в открытых реальных ставках (с
+    комиссией), free = now − open. None — своего банка нет (ставки в % — от общего банка)."""
+    cfg = runtime_state.coin_bank(asset)
+    if cfg is None:
+        return None
+    start, since = cfg
+    pnl, open_ = storage.coin_bank_flow(asset, since)
+    now = start + pnl
+    return {"start": start, "since": since, "pnl": pnl, "now": now, "open": open_, "free": now - open_}
+
+
+def min_order_usdc() -> float:
+    """Минимальный ордер биржи (5 акций) по потолку цены — ставка меньше не уйдёт."""
+    return round(MIN_ORDER_SHARES * (price_range()[1] + PRICE_SLIP) + 0.01, 2)
+
+
 def stake_rule(asset: str) -> tuple[str, float]:
     """Как считается ставка монеты: ("общая", $), ("usd", $) или ("pct", %)."""
     return runtime_state.coin_stake(asset) or ("общая", stake())
 
 
 def stake_for(asset: str | None) -> float:
-    """Сумма ставки монеты до правила «не меньше 5 акций»: общая, своя фиксированная или % банка
-    (банк неизвестен — общая)."""
+    """Сумма ставки монеты до правила «не меньше 5 акций»: общая, своя фиксированная или % банка.
+    % — от своего банка монеты (🏦), а нет его — от общего (неизвестен — общая сумма).
+    Со своим банком ставка не больше его свободных денег."""
     if asset is None:
         return stake()
     mode, value = stake_rule(asset)
+    own = coin_bank(asset)
     if mode == "pct":
-        b, _src = bank()
-        if b is None:
-            return stake()
-        return round(min(runtime_state.STAKE_LIMITS[1], b * value / 100.0), 2)
-    return value
+        if own is not None:
+            amt = max(0.0, own["now"]) * value / 100.0
+        else:
+            b, _src = bank()
+            if b is None:
+                return stake()
+            amt = b * value / 100.0
+        amt = min(runtime_state.STAKE_LIMITS[1], amt)
+    else:
+        amt = value
+    if own is not None:
+        amt = min(amt, max(0.0, own["free"]))
+    return round(amt, 2)
 
 
 def stake_label(asset: str) -> str:
-    """«$20», «5% банка (~$10.67)», «общая $5»."""
+    """«$20», «5% банка (~$10.67)», «10% банка BTC (~$11.24)», «общая $5»."""
     mode, value = stake_rule(asset)
-    if mode == "usd":
-        return f"${value:g}"
+    own = coin_bank(asset)
     if mode == "pct":
+        if own is not None:
+            return f"{value:g}% банка {asset.upper()} (~${stake_for(asset):.2f})"
         b, _src = bank()
         return f"{value:g}% банка" + (f" (~${b * value / 100:.2f})" if b is not None else f" (банк неизвестен — общая ${stake():g})")
-    return f"общая ${value:g}"
+    s = f"${value:g}" if mode == "usd" else f"общая ${value:g}"
+    if own is not None and own["free"] < value - 0.005:
+        s += f" (в банке {asset.upper()} свободно ${max(0.0, own['free']):.2f})"
+    return s
 
 
 def stake_button(asset: str) -> str:
     mode, value = stake_rule(asset)
-    return {"usd": f"${value:g}", "pct": f"{value:g}%"}.get(mode, "общая")
+    s = {"usd": f"${value:g}", "pct": f"{value:g}%"}.get(mode, "общая")
+    return s + (" 🏦" if runtime_state.coin_bank(asset) else "")
+
+
+def live_target(asset: str, usdc: float) -> tuple[float, str]:
+    """Сколько реально ставить: сумма ставки, но не больше баланса кошелька и свободных денег банка монеты.
+    (сумма, что её урезало: "" — ничего, "wallet" — кошелёк, "coin" — банк монеты)."""
+    target, why = usdc, ""
+    wallet = _bank["wallet"]
+    if wallet is not None and target > wallet:
+        target, why = round(float(wallet) - 0.01, 2), "wallet"          # на балансе меньше — на сколько есть
+    own = coin_bank(asset)
+    if own is not None and target > own["free"]:
+        target, why = math.floor(max(0.0, own["free"]) * 100) / 100, "coin"
+    return target, why
 
 
 def bet_usdc(cap: float, asset: str | None = None) -> float:
@@ -776,10 +826,10 @@ async def _notify(text: str) -> None:
         pass
 
 
-async def _notify_error(asset: str, exc: BaseException) -> None:
+async def _notify_error(asset: str, exc: BaseException, key: str | None = None) -> None:
     """Ошибка ордера, которую повтор не лечит (баланс, ключ), — в Telegram, но одна и та же не чаще
-    раза в ERROR_NOTE_EVERY_SEC."""
-    key = str(exc).strip().lower()[:80]
+    раза в ERROR_NOTE_EVERY_SEC. key — что считать «той же» (по умолчанию текст ошибки)."""
+    key = (key or str(exc)).strip().lower()[:80]
     now = time.time()
     if now - _err_notes.get(key, 0.0) < ERROR_NOTE_EVERY_SEC:
         return
@@ -797,14 +847,19 @@ async def _enter_live(w: Win, info: dict, base: dict, cap: float, usdc: float, n
             _trade_note["stop_day"] = day
             await _notify(f"⏱ Реальные ставки остановлены до конца дня — {why}. Тестовые идут дальше.")
         return
+    target, limited = live_target(w.asset, usdc)
+    if limited == "coin" and target < max(MIN_TRADE_USDC, round(MIN_ORDER_SHARES * cap + 0.01, 2)):
+        own = coin_bank(w.asset) or {"free": 0.0, "now": 0.0}
+        await _notify_error(w.asset, RuntimeError(
+            f"в банке монеты свободно ${max(0.0, own['free']):.2f} (банк ${own['now']:.2f}) — меньше минимального "
+            f"ордера; реальные ставки по {w.asset.upper()} не идут, пока банк не пополнишь (🪙 → 💵 → 🏦). "
+            "Тест идёт."), key=f"coinbank:{w.asset}")
+        return
     from src import polymarket_client
     t0 = time.monotonic()
     side, token = info["side"], info["token"]
     lo_t = window()[1]
-    target = usdc
     wallet = _bank["wallet"]
-    if wallet is not None and target > wallet:
-        target = round(float(wallet) - 0.01, 2)          # на балансе меньше ставки — на сколько есть
     spent = shares = 0.0
     oids: list[str] = []
     status = ""
@@ -828,7 +883,9 @@ async def _enter_live(w: Win, info: dict, base: dict, cap: float, usdc: float, n
         left = round(target - spent, 2)
         min_amt = max(MIN_TRADE_USDC, round(MIN_ORDER_SHARES * cur_cap + 0.01, 2))
         if left < min_amt:
-            if not spent and wallet is not None:
+            if not spent and limited == "coin":
+                last = f"в банке монеты свободно ${target:.2f} — меньше минимального ордера ${min_amt:.2f}"
+            elif not spent and wallet is not None:
                 last = f"на балансе ${wallet:.2f} — меньше минимального ордера ${min_amt:.2f}"
                 await _notify_error(w.asset, RuntimeError(f"на балансе ${wallet:.2f} — меньше ставки, "
                                                           "реальная не ушла"))
@@ -996,6 +1053,45 @@ def bank_line() -> str:
     return f"🏦 Банк для ставок в %: неизвестен ({why}) — монеты с % ставят общую сумму; можно задать вручную"
 
 
+def coin_bank_short(asset: str) -> str:
+    """«$112.40 (задан $100 02.11 11:40 UTC)» или «не задан»."""
+    own = coin_bank(asset)
+    if own is None:
+        return "не задан"
+    return f"${own['now']:.2f} (задан ${own['start']:g} {time.strftime('%d.%m %H:%M', time.gmtime(own['since']))} UTC)"
+
+
+def coin_bank_line(asset: str) -> str:
+    """«🏦 Банк BTC: $100.00 → $112.40 (+12.40 с 02.11 11:40 UTC), в ставках $10.00, свободно $102.40»."""
+    own = coin_bank(asset)
+    a = asset.upper()
+    if own is None:
+        return f"🏦 Свой банк {a}: не задан — ставки в % считаются от общего банка."
+    since = time.strftime("%d.%m %H:%M", time.gmtime(own["since"]))
+    s = (f"🏦 Банк {a}: ${own['start']:.2f} → ${own['now']:.2f} ({own['pnl']:+.2f} с {since} UTC)"
+         + (f", в ставках ${own['open']:.2f}" if own["open"] > 0.005 else "")
+         + f", свободно ${max(0.0, own['free']):.2f}")
+    if own["free"] < min_order_usdc():
+        s += f" — ⚠️ меньше минимального ордера (~${min_order_usdc():g}), реальные ставки по {a} стоят"
+    return s
+
+
+def banks_warning() -> str | None:
+    """Свободные деньги банков монет больше баланса кошелька — монеты будут делить кошелёк."""
+    wallet = _bank["wallet"]
+    if wallet is None:
+        return None
+    total = 0.0
+    for a in settings.ASSETS:
+        own = coin_bank(a)
+        if own is not None:
+            total += max(0.0, own["free"])
+    if total > float(wallet) + 0.5:
+        return (f"⚠️ Свободные деньги банков монет ${total:.2f} больше баланса кошелька ${float(wallet):.2f} — "
+                "реальные ставки упрутся в кошелёк.")
+    return None
+
+
 def coin_lines() -> list[str]:
     out = []
     for a in settings.ASSETS:
@@ -1003,7 +1099,11 @@ def coin_lines() -> list[str]:
         mark = f"{'✅' if runtime_state.is_asset_enabled(a) else '⏸'} {'🔴' if coin_live(a) else '🧪'}"
         if now_skipped(a):
             mark += " (рынков 5m нет)"
-        s = f"{a.upper()} {mark} · 💵 {stake_label(a)} — " + stats_line("тест", test)
+        own = coin_bank(a)
+        bank_s = ""
+        if own is not None:
+            bank_s = f" · 🏦 ${own['now']:.2f}" + (" ⚠️ исчерпан" if own["free"] < min_order_usdc() else "")
+        s = f"{a.upper()} {mark} · 💵 {stake_label(a)}{bank_s} — " + stats_line("тест", test)
         if real["bets"] or coin_live(a):
             s += "; " + stats_line("реальные", real)
             miss = sum(1 for t in storage.trades_since(0) if t["asset"] == a and not t["dry_run"]
@@ -1082,6 +1182,12 @@ def stats_text() -> str:
     if any(runtime_state.coin_stake(a) and runtime_state.coin_stake(a)[0] == "pct" for a in settings.ASSETS) \
             or settings.POLY_PRIVATE_KEY:
         lines += ["", bank_line()]
+    own = [a for a in settings.ASSETS if runtime_state.coin_bank(a)]
+    if own:
+        lines += [""] + [coin_bank_line(a) for a in own]
+        warn = banks_warning()
+        if warn:
+            lines.append(warn)
     lines += ["", recorder_line(), chainlink_line(), atr_feed.status_line(settings.ASSETS)]
     if _stats["discovery_errors"]:
         lines.append(f"Поиск рынков: ошибок {_stats['discovery_errors']}, последняя: {_stats['last_error']}")
@@ -1099,6 +1205,14 @@ def report_caption(from_label: str, to_label: str, since_ts: int) -> str:
     if real["bets"] or miss:
         lines.append(stats_line("Реальные за период", real)
                      + (f"; не купилось за окно входа: {miss} (причины — в колонке note)" if miss else ""))
+    banks = []
+    for a in settings.ASSETS:
+        own = coin_bank(a)
+        if own is not None:
+            banks.append(f"{a.upper()} ${own['now']:.2f} ({own['pnl']:+.2f})"
+                         + (" ⚠️ исчерпан" if own["free"] < min_order_usdc() else ""))
+    if banks:
+        lines.append("🏦 Банки монет: " + ", ".join(banks))
     return "\n".join(lines)
 
 
