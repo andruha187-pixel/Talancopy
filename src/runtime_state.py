@@ -8,6 +8,7 @@
 
 У монеты может быть своя сумма входа (💵: $ или % банка) и свой банк (🏦): сумма,
 с которой монета стартовала, и момент, с которого считаем её реальные ставки.
+И сторона реальных ставок (🎯): обе, только UP или только DOWN — тестовые идут по обеим.
 """
 from __future__ import annotations
 import json
@@ -64,6 +65,16 @@ def _banks_json(v) -> str:
     return json.dumps(out, sort_keys=True)
 
 
+SIDES = ("UP", "DOWN")
+
+
+def _sides_json(v) -> str:
+    """Сторона реальных ставок монет: {"btc": "UP"} — только эта сторона; нет записи — обе."""
+    raw = json.loads(v) if isinstance(v, str) else dict(v or {})
+    out = {str(a).lower(): str(s).upper() for a, s in (raw or {}).items() if str(s).upper() in SIDES}
+    return json.dumps(out, sort_keys=True)
+
+
 def _sec(v) -> int:
     return int(min(WINDOW_LIMITS[1], max(WINDOW_LIMITS[0], int(float(v)))))
 
@@ -93,6 +104,8 @@ _DEFAULTS = {
     "late_bank_manual": max(0.0, settings.LATE_BANK_USDC),
     # свой банк монеты: сумма и с какого момента считаем её реальные ставки (нет записи — общий банк)
     "late_coin_banks": "{}",
+    # сторона реальных ставок монеты: "UP" / "DOWN" (нет записи — обе); тестовые — всегда обе
+    "late_coin_sides": "{}",
 }
 
 _CASTERS = {
@@ -112,6 +125,7 @@ _CASTERS = {
     "late_coin_stakes": _stakes_json,
     "late_bank_manual": lambda v: min(BANK_LIMITS[1], max(BANK_LIMITS[0], float(v))),
     "late_coin_banks": _banks_json,
+    "late_coin_sides": _sides_json,
 }
 
 _state: dict = dict(_DEFAULTS)
@@ -222,3 +236,26 @@ def set_coin_bank(asset: str, start: float | None, since: int | None = None) -> 
     else:
         banks[asset.lower()] = {"start": float(start), "since": int(time.time() if since is None else since)}
     set("late_coin_banks", _banks_json(banks))
+
+
+# --- Сторона реальных ставок монеты: "UP" / "DOWN"; None — обе (тестовые — всегда обе) ---
+
+def coin_sides() -> dict:
+    try:
+        return json.loads(str(_state.get("late_coin_sides") or "{}"))
+    except ValueError:
+        return {}
+
+
+def coin_side(asset: str) -> str | None:
+    return coin_sides().get(asset.lower())
+
+
+def set_coin_side(asset: str, side: str | None) -> None:
+    """side "UP" / "DOWN" — реальные ставки по монете только на эту сторону; None — обе."""
+    sides = coin_sides()
+    if side is None or str(side).upper() not in SIDES:
+        sides.pop(asset.lower(), None)
+    else:
+        sides[asset.lower()] = str(side).upper()
+    set("late_coin_sides", _sides_json(sides))

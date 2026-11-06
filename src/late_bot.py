@@ -16,6 +16,9 @@
 
 Ставки — по включённым монетам (🪙): тестовая всегда, реальная — если монета 🔴
 и бот в 🔴 LIVE, есть ключ и не достигнут дневной стоп. Одна ставка на окно.
+У монеты можно разрешить реальные ставки только на одну сторону (🎯 только UP /
+только DOWN): тестовая всё равно ставится по обеим — видно, как сыграла бы
+выключенная сторона (в 📊 и в отчёте — итоги теста по сторонам).
 Сумма — общая (⚙️) или своя у монеты (🪙 💵): фиксированная $ или % от банка.
 Банк — свой у монеты (🏦: заданная сумма + результат её реальных ставок с этого
 момента; ставка не больше его свободных денег, кончились — реальные по монете
@@ -259,6 +262,25 @@ def coin_live(asset: str) -> bool:
 
 def live_coins() -> list[str]:
     return [a for a in trade_assets() if coin_live(a)]
+
+
+def side_allowed(asset: str, side: str) -> bool:
+    """Реальная ставка по этой стороне разрешена (🎯)? Тестовые идут по обеим всегда."""
+    only = runtime_state.coin_side(asset)
+    return only is None or only == side
+
+
+def side_mark(asset: str) -> str:
+    return {"UP": "⬆️", "DOWN": "⬇️"}.get(runtime_state.coin_side(asset) or "", "")
+
+
+def side_label(asset: str) -> str:
+    return {"UP": "только UP", "DOWN": "только DOWN"}.get(runtime_state.coin_side(asset) or "", "обе стороны")
+
+
+def coin_name(asset: str) -> str:
+    """«BTC» или «BTC⬆️» — если реальные только на одну сторону."""
+    return asset.upper() + side_mark(asset)
 
 
 # ------------------------------------------------- сумма ставки и банк ----
@@ -790,7 +812,8 @@ def _enter(w: Win, info: dict, now: float) -> int:
                 atr=_num(info["atr"], 6), ask=ask, rule=rule_tag())
     tid = storage.trade_log(**base, price=price, size_usdc=spent, shares=round(spent / price, 4),
                             fee_usdc=fee_for(spent, price), dry_run=1, status="DRY")
-    if coin_live(w.asset) and not storage.trade_exists(w.asset, w.start, dry_run=False):
+    if (coin_live(w.asset) and side_allowed(w.asset, info["side"])
+            and not storage.trade_exists(w.asset, w.start, dry_run=False)):
         _spawn(_enter_live(w, info, base, cap, usdc, now))
     return 1 if tid else 0
 
@@ -982,9 +1005,9 @@ def trim_paths(now: float | None = None) -> int:
 
 # ------------------------------------------------------------- итоги ----
 
-def trade_stats(since_ts: int = 0, live: bool = False, asset: str | None = None) -> dict:
+def trade_stats(since_ts: int = 0, live: bool = False, asset: str | None = None, side: str | None = None) -> dict:
     rows = [t for t in storage.trades_since(since_ts) if bool(t["dry_run"]) != live
-            and (asset is None or t["asset"] == asset)]
+            and (asset is None or t["asset"] == asset) and (side is None or t["side"] == side)]
     bets = [t for t in rows if not str(t["status"] or "").startswith("SKIP")]
     settled = [t for t in bets if t["outcome"]]
     wins = sum(1 for t in settled if t["outcome"] == t["side"])
@@ -1010,10 +1033,11 @@ def mode_text() -> str:
     coins = live_coins()
     if runtime_state.get("dry_run"):
         return "🧪 DRY RUN — реальных ордеров нет" + (
-            f" (🔴 помечены {', '.join(a.upper() for a in coins)} — пойдут после «🔴 Включить LIVE»)" if coins else "")
+            f" (🔴 помечены {', '.join(coin_name(a) for a in coins)} — пойдут после «🔴 Включить LIVE»)" if coins else "")
     if not coins:
         return "🔴 LIVE, но ни одна включённая монета не 🔴 — реальных ставок нет"
-    return f"🔴 LIVE — реальные ставки по {', '.join(a.upper() for a in coins)}"
+    return f"🔴 LIVE — реальные ставки по {', '.join(coin_name(a) for a in coins)}" + (
+        " (⬆️/⬇️ — только UP / только DOWN)" if any(side_mark(a) for a in coins) else "")
 
 
 def strategy_lines() -> list[str]:
@@ -1076,6 +1100,27 @@ def coin_bank_line(asset: str) -> str:
     return s
 
 
+def short_stats(name: str, st: dict) -> str:
+    """«UP 26 ставок, проигр. 0, +7.10 $ (+5.8%)»."""
+    if not st["settled"]:
+        return f"{name}: ставок нет" if not st["bets"] else f"{name}: {st['bets']} (ещё не разыграны)"
+    lost = st["settled"] - st["wins"]
+    return (f"{name} {bets_text(st['settled'])}, проигр. {lost}, {st['pnl']:+.2f} $"
+            + (f" ({st['pnl'] / st['staked'] * 100:+.1f}%)" if st["staked"] else ""))
+
+
+def side_lines(since_ts: int = 0) -> list[str]:
+    """По включённым монетам — тестовые ставки отдельно на UP и на DOWN (для решения 🎯)."""
+    out = []
+    for a in trade_assets():
+        up, dn = trade_stats(since_ts, False, a, "UP"), trade_stats(since_ts, False, a, "DOWN")
+        if not (up["bets"] or dn["bets"]):
+            continue
+        out.append(f"{coin_name(a)}: {short_stats('UP', up)} | {short_stats('DOWN', dn)}"
+                   + (f" — реальные: {side_label(a)}" if runtime_state.coin_side(a) else ""))
+    return out
+
+
 def banks_warning() -> str | None:
     """Свободные деньги банков монет больше баланса кошелька — монеты будут делить кошелёк."""
     wallet = _bank["wallet"]
@@ -1096,7 +1141,7 @@ def coin_lines() -> list[str]:
     out = []
     for a in settings.ASSETS:
         test, real = trade_stats(0, False, a), trade_stats(0, True, a)
-        mark = f"{'✅' if runtime_state.is_asset_enabled(a) else '⏸'} {'🔴' if coin_live(a) else '🧪'}"
+        mark = f"{'✅' if runtime_state.is_asset_enabled(a) else '⏸'} {'🔴' if coin_live(a) else '🧪'}{side_mark(a)}"
         if now_skipped(a):
             mark += " (рынков 5m нет)"
         own = coin_bank(a)
@@ -1176,6 +1221,10 @@ def chainlink_line(now: float | None = None) -> str:
 def stats_text() -> str:
     lines = ["📊 Статистика", ""] + strategy_lines() + ["", "По монетам (за всё время в базе):"]
     lines += ["  " + x for x in coin_lines()]
+    sides = side_lines()
+    if sides:
+        lines += ["", "Тест по сторонам (за всё время в базе; ⬆️/⬇️ — реальные только UP / только DOWN):"]
+        lines += ["  " + x for x in sides]
     w = why_lines()
     if w:
         lines += [""] + w
@@ -1205,6 +1254,15 @@ def report_caption(from_label: str, to_label: str, since_ts: int) -> str:
     if real["bets"] or miss:
         lines.append(stats_line("Реальные за период", real)
                      + (f"; не купилось за окно входа: {miss} (причины — в колонке note)" if miss else ""))
+    up, dn = trade_stats(since_ts, False, side="UP"), trade_stats(since_ts, False, side="DOWN")
+    if up["bets"] or dn["bets"]:
+        lines.append(f"⏱ Тест по сторонам за период: {short_stats('UP', up)} | {short_stats('DOWN', dn)}")
+    for a in trade_assets():
+        only = runtime_state.coin_side(a)
+        if only:
+            off = "DOWN" if only == "UP" else "UP"
+            lines.append(f"🎯 {coin_name(a)}: реальные {side_label(a)}; выключенная сторона в тесте за период — "
+                         + short_stats(off, trade_stats(since_ts, False, a, off)))
     banks = []
     for a in settings.ASSETS:
         own = coin_bank(a)

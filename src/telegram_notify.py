@@ -5,7 +5,8 @@
   ⚙️ Настройки — вкл/выкл, окно входа (за сколько до конца), цена, до страйка
                  (% и ATR), сумма входа, дневной стоп; ✏️ — своё значение сообщением
   🪙 Монеты    — у каждой: ✅ вкл / ⏸ выкл, 🧪 тест / 🔴 реально и 💵 своя сумма входа
-                 (общая, фиксированная $ или % от банка) и 🏦 свой банк монеты
+                 (общая, фиксированная $ или % от банка), 🏦 свой банк монеты и
+                 🎯 сторона реальных ставок (обе / только UP / только DOWN)
   📊 Статистика · 📤 Файлы
   🔴 Включить LIVE (с подтверждением) / 🧪 Выключить LIVE
 
@@ -117,6 +118,7 @@ def coins_text() -> str:
              "🧪 — только тестовые ставки, 🔴 — ещё и реальные, когда бот в 🔴 LIVE.",
              "💵 — сумма входа монеты: общая (⚙️), своя фиксированная $ или % от банка.",
              "🏦 — у монеты свой банк: растёт и падает только от её реальных ставок (задаётся в 💵).",
+             "⬆️/⬇️ — реальные ставки по монете только UP / только DOWN (тест — по обеим сторонам; задаётся в 💵).",
              ""] + late_bot.coin_lines() + ["", "Режим: " + late_bot.mode_text()]
     warn = late_bot.banks_warning()
     if warn:
@@ -129,7 +131,7 @@ def coins_markup() -> InlineKeyboardMarkup:
     for a in settings.ASSETS:
         on, live = runtime_state.is_asset_enabled(a), runtime_state.is_asset_live(a)
         rows.append((Btn(f"{a.upper()} {'✅ вкл' if on else '⏸ выкл'}", callback_data=f"c:on:{a}"),
-                     Btn(f"{'🔴 реально' if live else '🧪 тест'}", callback_data=f"c:lv:{a}"),
+                     Btn(f"{'🔴 реально' if live else '🧪 тест'}{late_bot.side_mark(a)}", callback_data=f"c:lv:{a}"),
                      Btn(f"💵 {late_bot.stake_button(a)}", callback_data=f"cs:{a}")))
     rows.append((Btn("🔄 Обновить", callback_data="co"), BACK))
     return _menu(*rows)
@@ -156,6 +158,9 @@ def coin_stake_text(asset: str, head: str = "") -> str:
         "Меньше 5 акций биржа не берёт (при цене 0.95 это ~$4.8) — ставка будет не меньше. Тестовые ставки "
         "считаются с той же суммой.",
         "",
+        f"🎯 Сторона реальных ставок {a}: {lb.side_label(asset)}. Тестовые ставки идут по обеим сторонам — "
+        "в 📊 и в отчёте видно, как сыграла бы выключенная.",
+        "",
         lb.coin_bank_line(asset),
         lb.bank_line(),
     ]
@@ -175,6 +180,8 @@ def coin_stake_markup(asset: str) -> InlineKeyboardMarkup:
         (Btn(f"🏦 ✏️ свой банк {asset.upper()}", callback_data=f"in:cb:{asset}"),)
         + ((Btn("🏦 ✖️ убрать свой банк", callback_data=f"cbx:{asset}"),) if own else ()),
         (Btn("🏦 ✏️ общий банк вручную", callback_data=f"in:bank:{asset}"),),
+        tuple(Btn(_mark(runtime_state.coin_side(asset) == s) + label, callback_data=f"csd:{asset}:{s or 'both'}")
+              for s, label in ((None, "🎯 обе"), ("UP", "⬆️ только UP"), ("DOWN", "⬇️ только DOWN"))),
         (Btn("◀️ Монеты", callback_data="co"), BACK),
     )
 
@@ -205,6 +212,15 @@ def coin_prompt_text(kind: str, asset: str, head: str = "") -> str:
 def apply_coin_stake(asset: str, mode: str | None, value: float | None = None) -> str:
     runtime_state.set_coin_stake(asset, mode, value)
     return f"✅ {asset.upper()}: сумма входа — {late_bot.stake_label(asset)}."
+
+
+def apply_coin_side(asset: str, side: str | None) -> str:
+    runtime_state.set_coin_side(asset, side)
+    a = asset.upper()
+    if side is None:
+        return f"✅ {a}: реальные ставки по обеим сторонам."
+    return (f"✅ {a}: реальные ставки только {side}. Тестовые идут по обеим — в 📊 и в отчёте видно, "
+            f"как сыграла бы {'DOWN' if side == 'UP' else 'UP'}.")
 
 
 def apply_coin_bank(asset: str, value: float | None) -> str:
@@ -461,7 +477,7 @@ def confirm_live_text() -> str:
     coins = lb.live_coins()
     lines = ["⚠️ Включить LIVE? Бот начнёт ставить реальные деньги на Polymarket.", ""]
     if coins:
-        lines.append(f"Реальные ставки пойдут по: {', '.join(a.upper() for a in coins)} — {stake_text()}; "
+        lines.append(f"Реальные ставки пойдут по: {', '.join(lb.coin_name(a) for a in coins)} — {stake_text()}; "
                      f"правило: {lb.rule_short()}.")
         test = [a.upper() for a in lb.trade_assets() if a not in coins]
         if test:
@@ -543,9 +559,13 @@ async def handle(data: str) -> tuple[str, InlineKeyboardMarkup]:
         return res
     if cmd == "co":
         return coins_text(), coins_markup()
-    if cmd in ("cs", "csg", "csu", "csp", "cbx") and len(parts) >= 2 and parts[1] in settings.ASSETS:
+    if cmd in ("cs", "csg", "csu", "csp", "cbx", "csd") and len(parts) >= 2 and parts[1] in settings.ASSETS:
         asset, head = parts[1], ""
-        if cmd == "cbx" and runtime_state.coin_bank(asset):
+        if cmd == "csd" and len(parts) == 3 and parts[2] in ("both", "UP", "DOWN"):
+            new = None if parts[2] == "both" else parts[2]
+            if runtime_state.coin_side(asset) != new:
+                head = apply_coin_side(asset, new)
+        elif cmd == "cbx" and runtime_state.coin_bank(asset):
             head = apply_coin_bank(asset, None)
         elif cmd == "csg" and runtime_state.coin_stake(asset):
             head = apply_coin_stake(asset, None)
